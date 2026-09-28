@@ -3,7 +3,7 @@ import os
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
 
@@ -93,6 +93,14 @@ def parse_workitem_url(url: str) -> tuple[str, str, int]:
     return collection, project, int(item_id)
 
 
+def parse_team(url: str) -> str | None:
+    """Команда из ссылки на доску вида .../_boards/board/t/<Команда>/...; None, если ее в ссылке нет."""
+    segments = [s for s in urlparse(url).path.split("/") if s]
+    if "t" in segments and segments.index("t") + 1 < len(segments):
+        return unquote(segments[segments.index("t") + 1])
+    return None
+
+
 def _session() -> requests.Session:
     """PAT из переменной TFS_PAT, иначе Windows-аутентификация текущего пользователя."""
     s = requests.Session()
@@ -155,17 +163,37 @@ class WorkItem:
     title: str
     type: str
     text: str
+    collection: str
+    project: str
+    relations: list[dict]
+    comments: list[str]  # текст комментариев, от старых к новым
+
+
+def _get_item(s: requests.Session, collection: str, item_id: int) -> dict:
+    r = s.get(f"{collection}/_apis/wit/workitems/{item_id}",
+              params={"api-version": API_VERSION, "$expand": "relations"})
+    r.raise_for_status()
+    return r.json()
+
+
+def _get_comments(s: requests.Session, collection: str, project: str, item_id: int) -> list[tuple[str, str]]:
+    """(автор, текст) комментариев карточки, от старых к новым."""
+    r = s.get(f"{collection}/{project}/_apis/wit/workItems/{item_id}/comments",
+              params={"api-version": COMMENTS_API_VERSION})
+    r.raise_for_status()
+    comments = sorted(r.json().get("comments", []), key=lambda c: c.get("id", 0))
+    return [((c.get("createdBy") or c.get("revisedBy") or {}).get("displayName") or "?",
+             html_to_text(c.get("text", ""))) for c in comments]
 
 
 def load_workitem(url: str, with_comments: bool = True) -> WorkItem:
-    """Загружает карточку: номер, заголовок и содержимое в виде текста."""
+    """Загружает карточку: номер, заголовок, содержимое в виде текста, связи и комментарии."""
     collection, project, item_id = parse_workitem_url(url)
     s = _session()
 
-    r = s.get(f"{collection}/_apis/wit/workitems/{item_id}",
-              params={"api-version": API_VERSION})
-    r.raise_for_status()
-    fields = r.json()["fields"]
+    item = _get_item(s, collection, item_id)
+    fields = item["fields"]
+    project = fields.get("System.TeamProject", project)
 
     lines = [
         f"{fields.get('System.WorkItemType', 'Work item')} #{item_id}: {fields.get('System.Title', '')}",
@@ -177,18 +205,93 @@ def load_workitem(url: str, with_comments: bool = True) -> WorkItem:
         if value:
             lines += ["", f"## {caption}", html_to_text(value)]
 
-    if with_comments and fields.get("System.CommentCount"):
-        r = s.get(f"{collection}/{project}/_apis/wit/workItems/{item_id}/comments",
-                  params={"api-version": COMMENTS_API_VERSION})
-        r.raise_for_status()
-        comments = r.json().get("comments", [])
-        if comments:
-            lines += ["", "## Комментарии"]
-            for c in comments:
-                author = (c.get("createdBy") or c.get("revisedBy") or {}).get("displayName") or "?"
-                lines.append(f"- {author}: {html_to_text(c.get('text', ''))}")
+    comments = _get_comments(s, collection, project, item_id) if fields.get("System.CommentCount") else []
+    if with_comments and comments:
+        lines += ["", "## Комментарии"]
+        lines += [f"- {author}: {text}" for author, text in comments]
 
     return WorkItem(id=item_id,
                     title=fields.get("System.Title", ""),
                     type=fields.get("System.WorkItemType", ""),
-                    text="\n".join(lines))
+                    text="\n".join(lines),
+                    collection=collection,
+                    project=project,
+                    relations=item.get("relations") or [],
+                    comments=[text for _, text in comments])
+
+
+# Типы родительских карточек, в которых ищется ветка разработки.
+PARENT_TYPES = {"User Story", "Feature"}
+
+# Имя ветки в комментарии: "branch vega/43383", "Ветка: vega/43383", "в ветви master" и т.п.
+COMMENT_BRANCH_RE = re.compile(r"(?<!\w)(?:branch|ветк|ветв)\w*(?:\s*[:=\-–—]\s*|\s+)[\"'`«]?([\w][\w./-]*)",
+                               re.IGNORECASE)
+
+
+def _linked_branches(relations: list[dict], repo_id: str) -> list[str]:
+    """Ветки репозитория repo_id, связанные с карточкой в секции Development (новые первыми)."""
+    branches = []
+    for rel in relations:
+        url = rel.get("url", "")
+        if rel.get("rel") != "ArtifactLink" or not url.lower().startswith("vstfs:///git/ref/"):
+            continue
+        # vstfs:///Git/Ref/<id проекта>%2F<id репозитория>%2FGB<ветка>
+        parts = unquote(url[len("vstfs:///Git/Ref/"):]).split("/", 2)
+        if len(parts) == 3 and parts[1].lower() == repo_id.lower() and parts[2].startswith("GB"):
+            branches.append(parts[2][2:])
+    return branches[::-1]
+
+
+def _comment_branches(comments: list[str]) -> list[str]:
+    """Имена веток, упомянутые в комментариях после слов branch/ветка/ветвь (новые первыми)."""
+    names = []
+    for text in reversed(comments):
+        for m in reversed(COMMENT_BRANCH_RE.findall(text)):
+            names.append(m.removeprefix("refs/heads/").rstrip("./"))
+    return names
+
+
+def _find_parent(s: requests.Session, item: WorkItem) -> WorkItem | None:
+    """Ближайший предок карточки с типом из PARENT_TYPES."""
+    relations, seen = item.relations, {item.id}
+    while True:
+        parent = next((r for r in relations if r.get("rel") == "System.LinkTypes.Hierarchy-Reverse"), None)
+        if parent is None:
+            return None
+        parent_id = int(parent["url"].rstrip("/").rsplit("/", 1)[-1])
+        if parent_id in seen:
+            return None
+        seen.add(parent_id)
+        data = _get_item(s, item.collection, parent_id)
+        fields, relations = data["fields"], data.get("relations") or []
+        if fields.get("System.WorkItemType") in PARENT_TYPES:
+            project = fields.get("System.TeamProject", item.project)
+            comments = _get_comments(s, item.collection, project, parent_id) if fields.get("System.CommentCount") else []
+            return WorkItem(id=parent_id, title=fields.get("System.Title", ""),
+                            type=fields["System.WorkItemType"], text="",
+                            collection=item.collection, project=project,
+                            relations=relations, comments=[text for _, text in comments])
+
+
+def find_base_branch(item: WorkItem, repo_url: str, exists) -> tuple[str, str]:
+    """Определяет ветку, в которой ведется работа по карточке. Возвращает (ветка, откуда она взята).
+
+    Порядок: родительская User Story/Feature (секция Development, затем комментарии),
+    сама карточка (так же), иначе master. exists(имя) проверяет, что ветка есть в репозитории.
+    """
+    s = _session()
+    collection, project, repo = parse_git_url(repo_url)
+    r = s.get(f"{collection}/{project}/_apis/git/repositories/{repo}", params={"api-version": API_VERSION})
+    r.raise_for_status()
+    repo_id = r.json()["id"]
+
+    parent = _find_parent(s, item)
+    for card in ([parent] if parent else []) + [item]:
+        label = f"{card.type} #{card.id}"
+        for branch in _linked_branches(card.relations, repo_id):
+            if exists(branch):
+                return branch, f"{label}, секция Development"
+        for branch in _comment_branches(card.comments):
+            if exists(branch):
+                return branch, f"{label}, комментарий"
+    return "master", "по умолчанию"
