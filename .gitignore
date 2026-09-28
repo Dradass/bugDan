@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Виртуальное окружение
+.venv/
+venv/
+
+# Секреты (TFS_PAT и т.п.)
+.env
+.env.*
+
+# IDE (PyCharm)
+.idea/
+
+# Claude Code: локальные настройки
+.claude/settings.local.json
+
+# ОС
+Thumbs.db
+Desktop.ini
+.DS_Store
