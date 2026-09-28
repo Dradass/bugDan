@@ -90,14 +90,16 @@ def decode_console(data: bytes) -> str:
 
 
 def ask_claude(repo_path: Path, prompt: str, model: str, claude: str | None = None,
-               allow_edits: bool = False) -> dict:
+               allow_edits: bool = False, tools: str | None = None, max_turns: int | None = None) -> dict:
     claude = claude or os.environ.get("CLAUDE_BIN") or shutil.which("claude") or sys.exit("claude CLI не найден в PATH")
-    tools = "Read,Grep,Glob,Edit,Write" if allow_edits else "Read,Grep,Glob"
+    if tools is None:
+        tools = "Read,Grep,Glob,Edit,Write" if allow_edits else "Read,Grep,Glob"
     args = [claude, "-p",
             "--output-format", "json",
             "--model", model,
-            "--allowedTools", tools,
-            "--max-turns", "60" if allow_edits else "40"]
+            "--max-turns", str(max_turns or (60 if allow_edits else 40))]
+    # Пустой список - отключить все инструменты (--allowedTools "" ничего не запрещает).
+    args += ["--allowedTools", tools] if tools else ["--tools", ""]
     if allow_edits:
         args += ["--permission-mode", "acceptEdits"]
     proc = subprocess.run(args, input=prompt.encode("utf-8"), cwd=repo_path, capture_output=True)
@@ -111,36 +113,73 @@ def ask_claude(repo_path: Path, prompt: str, model: str, claude: str | None = No
     return res
 
 
-def default_branch_name(bug_url: str, base: str, bug_id: int) -> str:
-    # Префикс - команда из ссылки на доску: .../_boards/board/t/Vega/Stories/?workitem=43383 -> vega/43383-ai-fix.
+SLUG_PROMPT = """Придумай короткое имя git-ветки для исправления бага.
+Требования: от 2 до 7 английских слов в kebab-case (только a-z, 0-9 и дефисы), передающих суть проблемы,
+например fix-null-price-in-order-export. Без номера бага, без префиксов и кавычек.
+Ответь только именем, одной строкой.
+
+Название бага: {title}
+Описание:
+---
+{bug}
+---"""
+
+TRANSLIT = dict(zip("абвгдеёзийклмнопрстуфхцыэ", "abvgdeeziyklmnoprstufhcye")) | {
+    "ж": "zh", "ч": "ch", "ш": "sh", "щ": "sch", "ю": "yu", "я": "ya", "ъ": "", "ь": ""}
+
+
+def kebab_words(text: str) -> list[str]:
+    text = "".join(TRANSLIT.get(ch, ch) for ch in text.lower())
+    return re.findall(r"[a-z0-9]+", text)
+
+
+def branch_slug(repo_path: Path, title: str, bug: str, model: str, claude: str | None) -> str:
+    """Постфикс ветки из 2-7 слов в kebab-case по сути бага. Если Claude не справился - транслит названия."""
+    try:
+        res = ask_claude(repo_path, SLUG_PROMPT.format(title=title, bug=bug[:4000]), model, claude,
+                         tools="", max_turns=1)
+        words = kebab_words(res["result"].strip().splitlines()[0])
+        if 2 <= len(words) <= 7:
+            return "-".join(words)
+        print(f"Claude предложил неподходящий постфикс ветки: {res['result'][:100]!r}", file=sys.stderr)
+    except (SystemExit, Exception) as e:
+        print(f"Не удалось получить постфикс ветки от Claude: {e}", file=sys.stderr)
+    words = kebab_words(title)[:7] or ["bug"]
+    return "-".join(words if len(words) >= 2 else ["fix", *words])
+
+
+def branch_prefix(bug_url: str, base: str) -> str:
+    # Префикс - команда из ссылки на доску: .../_boards/board/t/Vega/Stories/?workitem=43383 -> vega/43383-<slug>.
     # В ссылке без команды (.../_workitems/edit/ID) берем префикс базовой ветки: vega/43375-x -> vega/...
     # Ветку внутри базовой (vega/x -> vega/x/43328) git создать не даст: имя уже занято файлом ref.
     team = parse_team(bug_url)
     if team:
-        prefix = re.sub(r"[^\w.-]+", "-", team.lower()).strip("-.")
-    else:
-        prefix = base.split("/")[0] if "/" in base else "bugfix"
-    return f"{prefix}/{bug_id}-ai-fix"
+        return re.sub(r"[^\w.-]+", "-", team.lower()).strip("-.")
+    return base.split("/")[0] if "/" in base else "bugfix"
 
 
-def branch_locations(repo: Path, remote: str, name: str) -> list[str]:
-    """Где уже есть ветка с таким именем: локально и/или на сервере."""
-    found = []
-    if subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"],
-                      cwd=repo, capture_output=True).returncode == 0:
-        found.append("в локальном репозитории")
-    if git("ls-remote", "--heads", remote, f"refs/heads/{name}", cwd=repo):
-        found.append(f"на сервере ({remote})")
+def existing_bug_branches(repo: Path, remote: str, name: str) -> list[str]:
+    """Ветки этого бага, локальные и на сервере: vega/455667-a и vega/455667-b считаются одной веткой,
+    описание после номера не сравнивается. Имя без номера (--new-branch my-fix) сравнивается целиком."""
+    m = re.match(r"(.+?/\d+)(?:-|$)", name)
+    same = (lambda n: n == m[1] or n.startswith(m[1] + "-")) if m else (lambda n: n == name)
+    local = [line.removeprefix("refs/heads/")
+             for line in git("for-each-ref", "--format=%(refname)", "refs/heads/", cwd=repo).splitlines()]
+    found = [f"{n} (в локальном репозитории)" for n in local if same(n)]
+    found += [f"{n} (на сервере {remote})" for n in sorted(remote_branches(repo, remote)) if same(n)]
     return found
 
 
 def fix_in_new_branch(a, repo_path: Path, repo_url: str, base: str, base_sha: str, remote: str,
                       bug_id: int, title: str, bug: str) -> None:
-    new_branch = a.new_branch or default_branch_name(a.bug_url, base, bug_id)
-    found = branch_locations(repo_path, remote, new_branch)
+    # Проверяем по префиксу и номеру бага до запроса постфикса у Claude, чтобы не тратить на него вызов.
+    new_branch = a.new_branch or f"{branch_prefix(a.bug_url, base)}/{bug_id}"
+    found = existing_bug_branches(repo_path, remote, new_branch)
     if found:
-        sys.exit(f"Ветка {new_branch} уже существует {' и '.join(found)}.\n"
-                 f"Работа прервана, ничего не изменено. Удалите ветку или задайте другое имя через --new-branch.")
+        sys.exit(f"Ветка для {new_branch} уже существует:\n  " + "\n  ".join(found) +
+                 "\nРабота прервана, ничего не изменено. Удалите ветку или задайте другое имя через --new-branch.")
+    if not a.new_branch:
+        new_branch += "-" + branch_slug(repo_path, title, bug, a.slug_model, a.claude)
 
     worktree = Path(a.worktree_dir) if a.worktree_dir else repo_path.parent / f"{repo_path.name}-ai" / str(bug_id)
     if worktree.exists():
@@ -224,13 +263,15 @@ def main():
     p.add_argument("--no-comments", action="store_true", help="Не добавлять комментарии карточки")
     p.add_argument("--print-bug", action="store_true", help="Только показать текст бага, без вызова Claude")
     p.add_argument("--analyze-only", action="store_true", help="Только анализ, без ветки и коммита")
-    p.add_argument("--new-branch", help="Имя новой ветки (по умолчанию <префикс>/<номер>-ai-fix)")
+    p.add_argument("--new-branch", help="Имя новой ветки (по умолчанию <префикс>/<номер>-<суть-бага>)")
     p.add_argument("--worktree-dir", help="Папка для новой ветки (по умолчанию <repo-path>-ai/<номер>)")
     p.add_argument("--no-push", action="store_true", help="Сделать коммит, но не пушить")
     p.add_argument("--no-pr", action="store_true", help="Не создавать pull request после push")
     p.add_argument("--publish-pr", action="store_true", help="Создать обычный pull request вместо черновика")
     p.add_argument("--keep-worktree", action="store_true", help="Не удалять папку новой ветки после push")
     p.add_argument("--model", default="claude-opus-5")
+    p.add_argument("--slug-model", default="claude-haiku-4-5",
+                   help="Модель для постфикса имени ветки по сути бага")
     p.add_argument("--claude", help="Путь к claude CLI (по умолчанию CLAUDE_BIN или поиск в PATH)")
     a = p.parse_args()
 
