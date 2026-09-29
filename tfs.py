@@ -93,6 +93,13 @@ def parse_workitem_url(url: str) -> tuple[str, str, int]:
     return collection, project, int(item_id)
 
 
+def area_team(area: str) -> str | None:
+    r"""Команда из Area карточки: уровень сразу под проектом (SmartInstruments\Vega\UI -> Vega);
+    None, если Area - корень проекта."""
+    parts = [s for s in area.split("\\") if s.strip()]
+    return parts[1].strip() if len(parts) > 1 else None
+
+
 def parse_team(url: str) -> str | None:
     """Команда из ссылки на доску вида .../_boards/board/t/<Команда>/...; None, если ее в ссылке нет."""
     segments = [s for s in urlparse(url).path.split("/") if s]
@@ -167,6 +174,7 @@ class WorkItem:
     project: str
     relations: list[dict]
     comments: list[str]  # текст комментариев, от старых к новым
+    area: str = ""  # System.AreaPath: SmartInstruments\Vega
 
 
 def _get_item(s: requests.Session, collection: str, item_id: int) -> dict:
@@ -217,7 +225,8 @@ def load_workitem(url: str, with_comments: bool = True) -> WorkItem:
                     collection=collection,
                     project=project,
                     relations=item.get("relations") or [],
-                    comments=[text for _, text in comments])
+                    comments=[text for _, text in comments],
+                    area=fields.get("System.AreaPath", ""))
 
 
 # Типы родительских карточек, в которых ищется ветка разработки.
