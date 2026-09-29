@@ -1,7 +1,8 @@
-"""HTTP-сервер для service hook TFS: исправляет баг (bug_fixer.fix_bug), когда на его карточку ставят тег.
+"""HTTP-сервер для service hook TFS: исправляет баг (bug_fixer.fix_bug), когда на его карточке оказываются
+оба тега AIFix и Applied.
 
 Подписка в TFS: Project Settings -> Service hooks -> Web Hooks, событие "Work item updated",
-фильтры: тег AIFix, измененное поле Tags. Какой тег запускает обработку, задает только фильтр подписки.
+фильтры: тег AIFix, измененное поле Tags. Наличие обоих тегов проверяет сервер (REQUIRED_TAGS).
     python server.py --repo-path D:\\Projects\\master\\RX
 """
 import argparse, base64, hmac, json, logging, os, queue, threading, traceback
@@ -9,16 +10,18 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from bug_fixer import fix_bug
 
 HERE = Path(__file__).resolve().parent
 HOST, PORT = "0.0.0.0", 8080
 HOOK_PATH = "/propose-fix"  # Путь, на который TFS отправляет события
-WORK_ITEM_TYPES = {"bug"}  # Типы карточек, в нижнем регистре
+WORK_ITEM_TYPES = {"bug"}  # Типы карточек
+REQUIRED_TAGS = {"aifix", "applied"}  # Теги, которые все должны стоять на карточке
 LOG_DIR = HERE / "logs"  # Логи исправлений и общий лог сервера
 MAX_BODY = 5 * 1024 * 1024
+DUPLICATE_PARAM = "allow-duplicate"  # ?allow-duplicate=1 в URL: создать новую ветку, даже если ветка бага уже есть
 
 log = logging.getLogger("bugdan")
 
@@ -28,14 +31,28 @@ def parse_tags(value) -> set[str]:
     return {t.strip().lower() for t in (value or "").split(";") if t.strip()}
 
 
-def added_tags(fields: dict) -> set[str]:
-    """Теги, появившиеся в этом изменении карточки (resource.fields события workitem.updated).
-    Какой тег запускает обработку, задает фильтр подписки в TFS."""
+def tags_change(fields: dict) -> tuple[set[str], set[str]] | None:
+    """Теги до и после этого изменения карточки (resource.fields события workitem.updated);
+    None, если теги не менялись."""
     change = fields.get("System.Tags")
     if not isinstance(change, dict):
-        return set()
+        return None
     # Когда тегов не было или их все удалили, oldValue / newValue в событии отсутствуют.
-    return parse_tags(change.get("newValue")) - parse_tags(change.get("oldValue"))
+    return parse_tags(change.get("oldValue")), parse_tags(change.get("newValue"))
+
+
+def tags_skip_reason(fields: dict) -> str | None:
+    """Причина не запускать исправление по тегам или None. Запуск - когда в этом изменении на карточке
+    впервые оказались все теги REQUIRED_TAGS (неважно, какой из них поставлен последним)."""
+    change = tags_change(fields)
+    if change is None:
+        return "теги не менялись"
+    old, new = change
+    if missing := REQUIRED_TAGS - new:
+        return "нет тегов " + ", ".join(sorted(missing))
+    if REQUIRED_TAGS <= old:
+        return "теги " + ", ".join(sorted(REQUIRED_TAGS)) + " стояли и до изменения"
+    return None
 
 
 def bug_url(resource: dict) -> str:
@@ -55,8 +72,8 @@ def select_bug(event: dict) -> tuple[int | None, str]:
     item_type = fields.get("System.WorkItemType", "")
     if item_type.lower() not in WORK_ITEM_TYPES:
         return None, f"тип карточки {item_type!r} не обрабатывается"
-    if not added_tags(resource.get("fields") or {}):
-        return None, "теги не добавлялись"
+    if reason := tags_skip_reason(resource.get("fields") or {}):
+        return None, reason
     try:
         return int(resource["workItemId"]), bug_url(resource)
     except (KeyError, TypeError, ValueError) as e:
@@ -68,40 +85,40 @@ class Runner:
 
     def __init__(self, repo_path: str, log_dir: Path):
         self.repo_path, self.log_dir = repo_path, log_dir
-        self.jobs: queue.Queue[tuple[int, str]] = queue.Queue()
+        self.jobs: queue.Queue[tuple[int, str, bool]] = queue.Queue()
         self.pending: set[int] = set()
         self.lock = threading.Lock()
         threading.Thread(target=self._work, daemon=True).start()
 
-    def submit(self, bug_id: int, url: str) -> bool:
+    def submit(self, bug_id: int, url: str, allow_duplicate: bool = False) -> bool:
         """Ставит карточку в очередь; False, если она уже ждет или обрабатывается (повтор события)."""
         with self.lock:
             if bug_id in self.pending:
                 return False
             self.pending.add(bug_id)
-        self.jobs.put((bug_id, url))
+        self.jobs.put((bug_id, url, allow_duplicate))
         return True
 
     def _work(self):
         while True:
-            bug_id, url = self.jobs.get()
+            bug_id, url, allow_duplicate = self.jobs.get()
             try:
-                self._run(bug_id, url)
+                self._run(bug_id, url, allow_duplicate)
             except Exception:
                 log.exception("Карточка %s: ошибка запуска", bug_id)
             finally:
                 with self.lock:
                     self.pending.discard(bug_id)
 
-    def _run(self, bug_id: int, url: str):
+    def _run(self, bug_id: int, url: str, allow_duplicate: bool):
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log_file = self.log_dir / f"{bug_id}-{datetime.now():%Y%m%d-%H%M%S}.log"
         log.info("Карточка %s: запуск, лог %s", bug_id, log_file)
         # Вывод bug_fixer (print) пишется в лог запуска. Запуски идут по одному, поэтому подмена stdout не мешает другим.
         with log_file.open("w", encoding="utf-8") as f, redirect_stdout(f), redirect_stderr(f):
-            print(f"bug-url: {url}\nrepo-path: {self.repo_path}\n")
+            print(f"bug-url: {url}\nrepo-path: {self.repo_path}\nallow-duplicate: {allow_duplicate}\n")
             try:
-                fix_bug(url, self.repo_path)
+                fix_bug(url, self.repo_path, allow_duplicate)
                 error = None
             except SystemExit as e:  # bug_fixer сообщает об ошибке через sys.exit("текст")
                 error = e.code
@@ -162,12 +179,19 @@ class HookHandler(BaseHTTPRequestHandler):
         if bug_id is None:
             log.debug("Событие пропущено: %s", detail)
             return self.reply(200, {"status": "ignored", "reason": detail})
-        if not self.server.runner.submit(bug_id, detail):
+        allow_duplicate = self.query_flag(DUPLICATE_PARAM)
+        if not self.server.runner.submit(bug_id, detail, allow_duplicate):
             log.info("Карточка %s уже в очереди, повтор события пропущен", bug_id)
             return self.reply(200, {"status": "duplicate", "bug": bug_id})
-        log.info("Карточка %s поставлена в очередь: %s", bug_id, detail)
+        log.info("Карточка %s поставлена в очередь%s: %s", bug_id,
+                 " (разрешен дубликат ветки)" if allow_duplicate else "", detail)
         # TFS ждет ответ недолго и повторяет запрос при ошибке, поэтому отвечаем сразу, а исправление идет в фоне.
-        self.reply(202, {"status": "queued", "bug": bug_id})
+        self.reply(202, {"status": "queued", "bug": bug_id, DUPLICATE_PARAM: allow_duplicate})
+
+    def query_flag(self, name: str) -> bool:
+        """Логический параметр query string: ?name, ?name=1, ?name=true или ?name=yes."""
+        values = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get(name)
+        return bool(values) and values[-1].strip().lower() in {"", "1", "true", "yes"}
 
     def authorized(self) -> bool:
         user, password = self.server.cfg.credentials

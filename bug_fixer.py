@@ -141,26 +141,41 @@ def branch_prefix(bug_url: str, area: str, base: str) -> str:
     return base.split("/")[0] if "/" in base else "bugfix"
 
 
-def existing_bug_branches(repo: Path, remote: str, name: str) -> list[str]:
-    """Ветки бага name (<префикс>/<номер>), локальные и на сервере: vega/455667-a и vega/455667-b
-    считаются одной веткой, описание после номера не сравнивается."""
+def existing_bug_branches(repo: Path, remote: str, name: str) -> list[tuple[str, str]]:
+    """Ветки бага name (<префикс>/<номер>), локальные и на сервере, как (ветка, где найдена):
+    vega/455667-a и vega/455667-b считаются одной веткой, описание после номера не сравнивается."""
     same = lambda n: n == name or n.startswith(name + "-")
     local = [line.removeprefix("refs/heads/")
              for line in git("for-each-ref", "--format=%(refname)", "refs/heads/", cwd=repo).splitlines()]
-    found = [f"{n} (в локальном репозитории)" for n in local if same(n)]
-    found += [f"{n} (на сервере {remote})" for n in sorted(remote_branches(repo, remote)) if same(n)]
+    found = [(n, "в локальном репозитории") for n in local if same(n)]
+    found += [(n, f"на сервере {remote}") for n in sorted(remote_branches(repo, remote)) if same(n)]
     return found
 
 
+def free_branch_name(name: str, taken: set[str]) -> str:
+    """name, а если оно занято - name-2, name-3 и т.д."""
+    candidate, n = name, 1
+    while candidate in taken:
+        n += 1
+        candidate = f"{name}-{n}"
+    return candidate
+
+
 def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, base_sha: str, remote: str,
-                      bug_id: int, title: str, bug: str, area: str) -> None:
+                      bug_id: int, title: str, bug: str, area: str, allow_duplicate: bool = False) -> None:
     # Проверяем по префиксу и номеру бага до запроса постфикса у Claude, чтобы не тратить на него вызов.
     new_branch = f"{branch_prefix(bug_url, area, base)}/{bug_id}"
     found = existing_bug_branches(repo_path, remote, new_branch)
+    listing = "\n  ".join(f"{n} ({where})" for n, where in found)
+    if found and not allow_duplicate:
+        sys.exit(f"Ветка для {new_branch} уже существует:\n  {listing}\n"
+                 "Работа прервана, ничего не изменено. Чтобы исправить баг заново, удалите ветку "
+                 "или повторите запрос с разрешением дубликата.")
     if found:
-        sys.exit(f"Ветка для {new_branch} уже существует:\n  " + "\n  ".join(found) +
-                 "\nРабота прервана, ничего не изменено. Чтобы исправить баг заново, удалите ветку.")
-    new_branch += "-" + branch_slug(repo_path, title, bug)
+        print(f"Ветка для {new_branch} уже существует, создаю еще одну (разрешен дубликат):\n  {listing}",
+              file=sys.stderr)
+    # Постфикс от Claude может совпасть с уже существующей веткой - тогда добавляем -2, -3...
+    new_branch = free_branch_name(f"{new_branch}-{branch_slug(repo_path, title, bug)}", {n for n, _ in found})
 
     worktree = repo_path.parent / f"{repo_path.name}-ai" / str(bug_id)
     if worktree.exists():
@@ -205,8 +220,9 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     print(f"Pull request {new_branch} -> {base}: {pr_url}", file=sys.stderr)
 
 
-def fix_bug(bug_url: str, repo_path: str) -> None:
+def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False) -> None:
     """Исправляет баг в новой ветке: коммит, push и черновик pull request.
+    allow_duplicate - создать новую ветку, даже если ветка этого бага уже есть.
     Ошибки завершаются через sys.exit("текст")."""
     repo_path = Path(repo_path)
     repo_url, current, remote = check_repo(repo_path)
@@ -218,4 +234,5 @@ def fix_bug(bug_url: str, repo_path: str) -> None:
     print(f"Базовая ветка: {base} ({source})", file=sys.stderr)
 
     base_sha = fetch_branch(repo_path, remote, base)
-    fix_in_new_branch(bug_url, repo_path, repo_url, base, base_sha, remote, item.id, item.title, item.text, item.area)
+    fix_in_new_branch(bug_url, repo_path, repo_url, base, base_sha, remote, item.id, item.title, item.text, item.area,
+                      allow_duplicate)
