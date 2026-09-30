@@ -3,7 +3,7 @@
 
 Подписка в TFS: Project Settings -> Service hooks -> Web Hooks, событие "Work item updated",
 фильтры: тег AIFix, измененное поле Tags. Дополнительный тег проверяет сервер.
-    python server.py --repo-path D:\\Projects\\master\\RX [--extra-tag Applied]
+    python server.py --repo-path D:\\Projects\\master\\RX [--extra-tag Applied] [--claude-rule rules.md]
 """
 import argparse, base64, hmac, json, logging, os, queue, threading, traceback
 from contextlib import redirect_stderr, redirect_stdout
@@ -81,11 +81,19 @@ def select_bug(event: dict, required_tags: set[str]) -> tuple[int | None, str]:
         return None, f"в событии нет данных карточки: {e!r}"
 
 
+def read_rule(path: Path) -> str:
+    """Текст файла с правилом написания кода для Claude."""
+    try:
+        return path.read_text(encoding="utf-8-sig").strip()
+    except (OSError, UnicodeDecodeError) as e:
+        raise SystemExit(f"Не удалось прочитать файл правила {path}: {e}")
+
+
 class Runner:
     """Очередь исправлений: по одному за раз, чтобы параллельные git fetch не мешали друг другу в одном репозитории."""
 
-    def __init__(self, repo_path: str, log_dir: Path):
-        self.repo_path, self.log_dir = repo_path, log_dir
+    def __init__(self, repo_path: str, log_dir: Path, rule_path: Path | None = None):
+        self.repo_path, self.log_dir, self.rule_path = repo_path, log_dir, rule_path
         self.jobs: queue.Queue[tuple[int, str, bool]] = queue.Queue()
         self.pending: set[int] = set()
         self.lock = threading.Lock()
@@ -117,9 +125,12 @@ class Runner:
         log.info("Карточка %s: запуск, лог %s", bug_id, log_file)
         # Вывод bug_fixer (print) пишется в лог запуска. Запуски идут по одному, поэтому подмена stdout не мешает другим.
         with log_file.open("w", encoding="utf-8") as f, redirect_stdout(f), redirect_stderr(f):
-            print(f"bug-url: {url}\nrepo-path: {self.repo_path}\nallow-duplicate: {allow_duplicate}\n")
+            print(f"bug-url: {url}\nrepo-path: {self.repo_path}\nallow-duplicate: {allow_duplicate}\n"
+                  f"claude-rule: {self.rule_path or '-'}\n")
             try:
-                fix_bug(url, self.repo_path, allow_duplicate)
+                # Файл правила читается при каждом запуске, чтобы его правки применялись без перезапуска сервера.
+                rules = read_rule(self.rule_path) if self.rule_path else None
+                fix_bug(url, self.repo_path, allow_duplicate, rules)
                 error = None
             except SystemExit as e:  # bug_fixer сообщает об ошибке через sys.exit("текст")
                 error = e.code
@@ -227,9 +238,14 @@ def main():
     p.add_argument("--extra-tag", default=DEFAULT_EXTRA_TAG,
                    help=f"Тег, который должен стоять на карточке вместе с {TRIGGER_TAG} (по умолчанию "
                         f"{DEFAULT_EXTRA_TAG}; пустая строка - достаточно одного {TRIGGER_TAG})")
+    p.add_argument("--claude-rule", type=Path,
+                   help="Путь до файла с правилом написания кода, которое Claude учитывает при исправлении")
     p.add_argument("--verbose", action="store_true", help="Писать в лог пропущенные события и HTTP-запросы")
     cfg = p.parse_args()
     cfg.required_tags = parse_tags(TRIGGER_TAG) | parse_tags(cfg.extra_tag)
+    if cfg.claude_rule:
+        cfg.claude_rule = cfg.claude_rule.resolve()
+        read_rule(cfg.claude_rule)  # Ошибка в пути видна сразу при запуске, а не при первом баге
     cfg.credentials = os.environ.get("BUGDAN_HOOK_USER", ""), os.environ.get("BUGDAN_HOOK_PASSWORD", "")
 
     # Консоль службы Windows пишет в кодировке ANSI, поэтому основной лог дублируется в файл в UTF-8.
@@ -241,9 +257,9 @@ def main():
     if not cfg.credentials[1]:
         log.warning("BUGDAN_HOOK_PASSWORD не задан: запросы принимаются без проверки Basic-аутентификации")
 
-    server = HookServer((HOST, PORT), cfg, Runner(cfg.repo_path, LOG_DIR))
-    log.info("Жду события на http://%s:%s%s, репозиторий %s, теги %s", HOST, PORT, HOOK_PATH, cfg.repo_path,
-             ", ".join(sorted(cfg.required_tags)))
+    server = HookServer((HOST, PORT), cfg, Runner(cfg.repo_path, LOG_DIR, cfg.claude_rule))
+    log.info("Жду события на http://%s:%s%s, репозиторий %s, теги %s, правило Claude %s", HOST, PORT, HOOK_PATH,
+             cfg.repo_path, ", ".join(sorted(cfg.required_tags)), cfg.claude_rule or "не задано")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

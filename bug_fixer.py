@@ -13,6 +13,12 @@ BUG_BLOCK = """Ты работаешь в репозитории {repo} (вет�
 ---
 """
 
+RULES_BLOCK = """Правила написания кода, которые нужно соблюдать при исправлении:
+---
+{rules}
+---
+"""
+
 FIX_TASK = """Задача:
 1. Найди в коде причину бага.
 2. Внеси исправление прямо в файлы репозитория. Изменения должны быть минимальными
@@ -162,7 +168,8 @@ def free_branch_name(name: str, taken: set[str]) -> str:
 
 
 def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, base_sha: str, remote: str,
-                      bug_id: int, title: str, bug: str, area: str, allow_duplicate: bool = False) -> None:
+                      bug_id: int, title: str, bug: str, area: str, allow_duplicate: bool = False,
+                      code_rules: str | None = None) -> None:
     # Проверяем по префиксу и номеру бага до запроса постфикса у Claude, чтобы не тратить на него вызов.
     new_branch = f"{branch_prefix(bug_url, area, base)}/{bug_id}"
     found = existing_bug_branches(repo_path, remote, new_branch)
@@ -193,7 +200,10 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
             git("branch", "-D", new_branch, cwd=repo_path)
 
     try:
-        prompt = BUG_BLOCK.format(repo=repo_url, branch=new_branch, bug=bug) + FIX_TASK
+        prompt = BUG_BLOCK.format(repo=repo_url, branch=new_branch, bug=bug)
+        if code_rules:
+            prompt += RULES_BLOCK.format(rules=code_rules)
+        prompt += FIX_TASK
         res = ask_claude(worktree, prompt, MODEL, allow_edits=True)
     except BaseException:
         cleanup(delete_branch=True)
@@ -228,9 +238,10 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
         print(f"Внимание: {e}", file=sys.stderr)
 
 
-def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False) -> None:
+def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False, code_rules: str | None = None) -> None:
     """Исправляет баг в новой ветке: коммит, push и черновик pull request.
     allow_duplicate - создать новую ветку, даже если ветка этого бага уже есть.
+    code_rules - правила написания кода, которые Claude учитывает при исправлении.
     Ошибки завершаются через sys.exit("текст")."""
     repo_path = Path(repo_path)
     repo_url, current, remote = check_repo(repo_path)
@@ -243,4 +254,4 @@ def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False) -> None
 
     base_sha = fetch_branch(repo_path, remote, base)
     fix_in_new_branch(bug_url, repo_path, repo_url, base, base_sha, remote, item.id, item.title, item.text, item.area,
-                      allow_duplicate)
+                      allow_duplicate, code_rules)
