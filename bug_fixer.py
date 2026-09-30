@@ -1,7 +1,7 @@
-import json, os, re, shutil, subprocess, sys
+import html, json, os, re, shutil, subprocess, sys
 from pathlib import Path
 
-from tfs import area_team, create_pull_request, find_base_branch, load_workitem, parse_team
+from tfs import add_workitem_comment, area_team, create_pull_request, find_base_branch, load_workitem, parse_team
 
 MODEL = "claude-opus-5"
 SLUG_MODEL = "claude-haiku-4-5"  # Модель для постфикса имени ветки по сути бага
@@ -218,6 +218,14 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     description = f"Карточка: {bug_url}\n\nИсправление предложено Claude.\n\n{summary}"
     pr_url = create_pull_request(repo_url, new_branch, base, f"#{bug_id} {title}", description, draft=True)
     print(f"Pull request {new_branch} -> {base}: {pr_url}", file=sys.stderr)
+
+    # Pull request уже создан, поэтому ошибка комментария не прерывает работу, а только выводится в лог.
+    link = html.escape(pr_url)
+    try:
+        add_workitem_comment(bug_url, f'Исправление бага: <a href="{link}">{link}</a>')
+        print(f"В карточку #{bug_id} добавлен комментарий со ссылкой на pull request.", file=sys.stderr)
+    except Exception as e:
+        print(f"Внимание: {e}", file=sys.stderr)
 
 
 def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False) -> None:

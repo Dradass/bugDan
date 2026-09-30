@@ -1,4 +1,5 @@
 """Загрузка карточки (work item) из TFS / Azure DevOps Server в виде текста для промпта."""
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -162,6 +163,20 @@ def create_pull_request(repo_url: str, source_branch: str, target_branch: str,
     if not r.ok:
         raise RuntimeError(f"Не удалось создать pull request: HTTP {r.status_code} {r.text[:500]}")
     return f"{collection}/{project}/_git/{repo}/pullrequest/{r.json()['pullRequestId']}"
+
+
+def add_workitem_comment(url: str, html: str) -> None:
+    """Добавляет комментарий (HTML) в карточку по ссылке на нее."""
+    collection, _, item_id = parse_workitem_url(url)
+    # POST .../comments появился только в API 5.1; запись в System.History работает во всех версиях TFS
+    # и попадает в Discussion карточки как обычный комментарий.
+    r = _session().patch(f"{collection}/_apis/wit/workitems/{item_id}",
+                         params={"api-version": API_VERSION},
+                         data=json.dumps([{"op": "add", "path": "/fields/System.History", "value": html}]),
+                         headers={"Content-Type": "application/json-patch+json"})
+    if not r.ok:
+        raise RuntimeError(f"Не удалось добавить комментарий в карточку #{item_id}: "
+                           f"HTTP {r.status_code} {r.text[:500]}")
 
 
 @dataclass

@@ -1,7 +1,8 @@
 # bugDan
 
 Исправление багов из TFS с помощью Claude: `bug_fixer.fix_bug` читает карточку, создает ветку от нужной
-базовой, просит Claude внести исправление, пушит ветку и создает черновик pull request.
+базовой, просит Claude внести исправление, пушит ветку, создает черновик pull request
+и добавляет в карточку комментарий «Исправление бага: <ссылка на pull request>».
 
 ## Запуск по тегам AIFix и Applied
 
@@ -16,7 +17,7 @@
 ### Запуск сервера
 
 ```
-set TFS_PAT=<PAT с правами Work Items (read) и Code (read & write)>
+set TFS_PAT=<PAT с правами Work Items (read & write) и Code (read & write)>
 set BUGDAN_HOOK_USER=tfs
 set BUGDAN_HOOK_PASSWORD=<пароль для вебхука>
 python server.py --repo-path D:\Projects\master\RX
