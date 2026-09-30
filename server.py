@@ -1,16 +1,18 @@
 """HTTP-сервер для service hook TFS: исправляет баг (bug_fixer.fix_bug), когда на его карточке оказываются
-тег AIFix и дополнительный тег (--extra-tag, по умолчанию Applied).
+тег AIFix и тег репозитория. Теги репозиториев, пути до них и необязательные файлы правил Claude задаются
+в config.json: {"tags": {"<тег>": {"repo": "<путь>", "rule": "<файл правила>"}}}.
 
 Подписка в TFS: Project Settings -> Service hooks -> Web Hooks, событие "Work item updated",
-фильтры: тег AIFix, измененное поле Tags. Дополнительный тег проверяет сервер.
-    python server.py --repo-path D:\\Projects\\master\\RX [--extra-tag Applied] [--claude-rule rules.md]
+фильтры: тег AIFix, измененное поле Tags. Тег репозитория проверяет сервер.
+    python server.py [--config config.json]
 """
-import argparse, base64, hmac, json, logging, os, queue, threading, traceback
+import argparse, base64, hmac, json, logging, os, queue, re, threading, traceback
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from typing import NamedTuple
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from bug_fixer import fix_bug
 
@@ -19,10 +21,11 @@ HOST, PORT = "0.0.0.0", 8080
 HOOK_PATH = "/propose-fix"  # Путь, на который TFS отправляет события
 WORK_ITEM_TYPES = {"bug"}  # Типы карточек
 TRIGGER_TAG = "AIFix"  # Тег, по которому срабатывает подписка TFS
-DEFAULT_EXTRA_TAG = "Applied"  # Дополнительный тег по умолчанию (--extra-tag)
+DEFAULT_CONFIG = HERE / "config.json"  # Конфиг с тегами репозиториев (--config)
 LOG_DIR = HERE / "logs"  # Логи исправлений и общий лог сервера
 MAX_BODY = 5 * 1024 * 1024
-DUPLICATE_PARAM = "allow-duplicate"  # ?allow-duplicate=1 в URL: создать новую ветку, даже если ветка бага уже есть
+GUID_RE = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
+DUPLICATE_PARAM ="allow-duplicate"  # ?allow-duplicate=1 в URL: создать новую ветку, даже если ветка бага уже есть
 
 log = logging.getLogger("bugdan")
 
@@ -42,43 +45,55 @@ def tags_change(fields: dict) -> tuple[set[str], set[str]] | None:
     return parse_tags(change.get("oldValue")), parse_tags(change.get("newValue"))
 
 
-def tags_skip_reason(fields: dict, required: set[str]) -> str | None:
-    """Причина не запускать исправление по тегам или None. Запуск - когда в этом изменении на карточке
-    впервые оказались все теги required (неважно, какой из них поставлен последним)."""
+def triggered_tags(fields: dict, repo_tags: set[str]) -> tuple[list[str], str | None]:
+    """Теги репозиториев, по которым нужно запустить исправление, и причина пропуска, если таких нет.
+    Запуск по тегу репозитория - когда в этом изменении на карточке впервые оказались он и AIFix
+    (неважно, какой из них поставлен последним)."""
     change = tags_change(fields)
     if change is None:
-        return "теги не менялись"
+        return [], "теги не менялись"
     old, new = change
-    if missing := required - new:
-        return "нет тегов " + ", ".join(sorted(missing))
-    if required <= old:
-        return "теги " + ", ".join(sorted(required)) + " стояли и до изменения"
-    return None
+    trigger = TRIGGER_TAG.lower()
+    if trigger not in new:
+        return [], f"нет тега {trigger}"
+    present = sorted(repo_tags & new)
+    if not present:
+        return [], "нет ни одного из тегов " + ", ".join(sorted(repo_tags))
+    tags = [t for t in present if not {trigger, t} <= old]
+    if not tags:
+        return [], f"теги {trigger}, " + ", ".join(present) + " стояли и до изменения"
+    return tags, None
 
 
 def bug_url(resource: dict) -> str:
     """Ссылка на карточку вида <коллекция>/<проект>/_workitems/edit/<id>, которую понимает bug_fixer."""
-    # resource.url: <коллекция>/_apis/wit/workItems/<id>/updates/<n>
+    # resource.url: <коллекция>/_apis/wit/workItems/<id>/updates/<n>, но TFS может добавить
+    # к коллекции id или имя проекта: <коллекция>/<проект>/_apis/...
     collection = resource["url"].split("/_apis/", 1)[0]
     project = resource["revision"]["fields"]["System.TeamProject"]
+    head, _, last = collection.rpartition("/")
+    if GUID_RE.fullmatch(last) or unquote(last).lower() == project.lower():
+        collection = head
     return f"{collection}/{quote(project)}/_workitems/edit/{resource['workItemId']}"
 
 
-def select_bug(event: dict, required_tags: set[str]) -> tuple[int | None, str]:
-    """Возвращает (номер карточки, ссылка), если событие должно запустить исправление, иначе (None, причина пропуска)."""
+def select_bug(event: dict, repo_tags: set[str]) -> tuple[int | None, str, list[str]]:
+    """Возвращает (номер карточки, ссылка, теги репозиториев), если событие должно запустить исправление,
+    иначе (None, причина пропуска, [])."""
     if event.get("eventType") != "workitem.updated":
-        return None, f"событие {event.get('eventType')!r} не обрабатывается"
+        return None, f"событие {event.get('eventType')!r} не обрабатывается", []
     resource = event.get("resource") or {}
     fields = (resource.get("revision") or {}).get("fields") or {}
     item_type = fields.get("System.WorkItemType", "")
     if item_type.lower() not in WORK_ITEM_TYPES:
-        return None, f"тип карточки {item_type!r} не обрабатывается"
-    if reason := tags_skip_reason(resource.get("fields") or {}, required_tags):
-        return None, reason
+        return None, f"тип карточки {item_type!r} не обрабатывается", []
+    tags, reason = triggered_tags(resource.get("fields") or {}, repo_tags)
+    if reason:
+        return None, reason, []
     try:
-        return int(resource["workItemId"]), bug_url(resource)
+        return int(resource["workItemId"]), bug_url(resource), tags
     except (KeyError, TypeError, ValueError) as e:
-        return None, f"в событии нет данных карточки: {e!r}"
+        return None, f"в событии нет данных карточки: {e!r}", []
 
 
 def read_rule(path: Path) -> str:
@@ -89,48 +104,85 @@ def read_rule(path: Path) -> str:
         raise SystemExit(f"Не удалось прочитать файл правила {path}: {e}")
 
 
+class Repo(NamedTuple):
+    path: Path  # Путь до репозитория решения
+    rule: Path | None  # Файл с правилом написания кода для Claude; None - без правила
+
+
+def read_repos(path: Path) -> dict[str, Repo]:
+    """Репозитории по тегам (в нижнем регистре) из секции "tags" конфига:
+    {"<тег>": {"repo": "<путь>", "rule": "<файл правила, необязательно>"}}.
+    Относительный путь до файла правила считается от папки конфига."""
+    try:
+        tags = json.loads(path.read_text(encoding="utf-8-sig"))["tags"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise SystemExit(f"Не удалось прочитать теги репозиториев из {path}: {e!r}")
+    if not isinstance(tags, dict) or not tags:
+        raise SystemExit(f'В {path} секция "tags" должна быть непустым словарем {{"<тег>": {{"repo": "<путь>"}}}}')
+    repos = {}
+    for tag, item in tags.items():
+        key = tag.strip().lower()
+        if not key or ";" in key or key == TRIGGER_TAG.lower() or key in repos:
+            raise SystemExit(f"В {path} недопустимый или повторяющийся тег {tag!r}")
+        if not isinstance(item, dict):
+            raise SystemExit(f'В {path} для тега {tag!r} нужен словарь {{"repo": "<путь>", "rule": "<файл правила>"}}')
+        repo = item.get("repo")
+        if not isinstance(repo, str) or not Path(repo).is_dir():
+            raise SystemExit(f'В {path} для тега {tag!r} в "repo" указан несуществующий путь {repo!r}')
+        rule = item.get("rule") or None
+        if rule is not None:
+            if not isinstance(rule, str):
+                raise SystemExit(f'В {path} для тега {tag!r} в "rule" должен быть путь до файла')
+            rule = (path.parent / rule).resolve()
+            read_rule(rule)  # Ошибка в пути видна сразу при запуске, а не при первом баге
+        repos[key] = Repo(Path(repo), rule)
+    return repos
+
+
 class Runner:
     """Очередь исправлений: по одному за раз, чтобы параллельные git fetch не мешали друг другу в одном репозитории."""
 
-    def __init__(self, repo_path: str, log_dir: Path, rule_path: Path | None = None):
-        self.repo_path, self.log_dir, self.rule_path = repo_path, log_dir, rule_path
-        self.jobs: queue.Queue[tuple[int, str, bool]] = queue.Queue()
-        self.pending: set[int] = set()
+    def __init__(self, repos: dict[str, Repo], log_dir: Path):
+        self.repos, self.log_dir = repos, log_dir
+        self.jobs: queue.Queue[tuple[int, str, str, bool]] = queue.Queue()
+        self.pending: set[tuple[int, str]] = set()
         self.lock = threading.Lock()
         threading.Thread(target=self._work, daemon=True).start()
 
-    def submit(self, bug_id: int, url: str, allow_duplicate: bool = False) -> bool:
-        """Ставит карточку в очередь; False, если она уже ждет или обрабатывается (повтор события)."""
+    def submit(self, bug_id: int, url: str, tag: str, allow_duplicate: bool = False) -> bool:
+        """Ставит карточку в очередь на исправление в репозитории тега; False, если она уже ждет
+        или обрабатывается в этом репозитории (повтор события)."""
         with self.lock:
-            if bug_id in self.pending:
+            if (bug_id, tag) in self.pending:
                 return False
-            self.pending.add(bug_id)
-        self.jobs.put((bug_id, url, allow_duplicate))
+            self.pending.add((bug_id, tag))
+        self.jobs.put((bug_id, url, tag, allow_duplicate))
         return True
 
     def _work(self):
         while True:
-            bug_id, url, allow_duplicate = self.jobs.get()
+            bug_id, url, tag, allow_duplicate = self.jobs.get()
             try:
-                self._run(bug_id, url, allow_duplicate)
+                self._run(bug_id, url, tag, allow_duplicate)
             except Exception:
-                log.exception("Карточка %s: ошибка запуска", bug_id)
+                log.exception("Карточка %s (%s): ошибка запуска", bug_id, tag)
             finally:
                 with self.lock:
-                    self.pending.discard(bug_id)
+                    self.pending.discard((bug_id, tag))
 
-    def _run(self, bug_id: int, url: str, allow_duplicate: bool):
+    def _run(self, bug_id: int, url: str, tag: str, allow_duplicate: bool):
+        repo = self.repos[tag]
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = self.log_dir / f"{bug_id}-{datetime.now():%Y%m%d-%H%M%S}.log"
-        log.info("Карточка %s: запуск, лог %s", bug_id, log_file)
+        log_file = self.log_dir / f"{bug_id}-{tag}-{datetime.now():%Y%m%d-%H%M%S}.log"
+        log.info("Карточка %s (%s): запуск в %s, лог %s", bug_id, tag, repo.path, log_file)
         # Вывод bug_fixer (print) пишется в лог запуска. Запуски идут по одному, поэтому подмена stdout не мешает другим.
         with log_file.open("w", encoding="utf-8") as f, redirect_stdout(f), redirect_stderr(f):
-            print(f"bug-url: {url}\nrepo-path: {self.repo_path}\nallow-duplicate: {allow_duplicate}\n"
-                  f"claude-rule: {self.rule_path or '-'}\n")
+            print(f"bug-url: {url}\ntag: {tag}\nrepo-path: {repo.path}\nallow-duplicate: {allow_duplicate}\n"
+                  f"claude-rule: {repo.rule or '-'}\n")
             try:
                 # Файл правила читается при каждом запуске, чтобы его правки применялись без перезапуска сервера.
-                rules = read_rule(self.rule_path) if self.rule_path else None
-                fix_bug(url, self.repo_path, allow_duplicate, rules)
+                rules = read_rule(repo.rule) if repo.rule else None
+                fix_bug(url, str(repo.path), allow_duplicate, rules)
                 error = None
             except SystemExit as e:  # bug_fixer сообщает об ошибке через sys.exit("текст")
                 error = e.code
@@ -139,9 +191,9 @@ class Runner:
                 error = traceback.format_exc()
                 print(error)
         if error:
-            log.error("Карточка %s: ошибка, подробности в %s", bug_id, log_file)
+            log.error("Карточка %s (%s): ошибка, подробности в %s", bug_id, tag, log_file)
         else:
-            log.info("Карточка %s: готово", bug_id)
+            log.info("Карточка %s (%s): готово", bug_id, tag)
 
 
 class HookServer(ThreadingHTTPServer):
@@ -187,18 +239,24 @@ class HookHandler(BaseHTTPRequestHandler):
 
     def propose_fix(self, event: dict):
         """Событие service hook TFS: ставит карточку в очередь на исправление."""
-        bug_id, detail = select_bug(event, self.server.cfg.required_tags)
+        runner = self.server.runner
+        bug_id, detail, tags = select_bug(event, set(runner.repos))
         if bug_id is None:
             log.debug("Событие пропущено: %s", detail)
             return self.reply(200, {"status": "ignored", "reason": detail})
         allow_duplicate = self.query_flag(DUPLICATE_PARAM)
-        if not self.server.runner.submit(bug_id, detail, allow_duplicate):
-            log.info("Карточка %s уже в очереди, повтор события пропущен", bug_id)
-            return self.reply(200, {"status": "duplicate", "bug": bug_id})
-        log.info("Карточка %s поставлена в очередь%s: %s", bug_id,
-                 " (разрешен дубликат ветки)" if allow_duplicate else "", detail)
+        queued = []
+        for tag in tags:
+            if not runner.submit(bug_id, detail, tag, allow_duplicate):
+                log.info("Карточка %s (%s) уже в очереди, повтор события пропущен", bug_id, tag)
+                continue
+            queued.append(tag)
+            log.info("Карточка %s (%s) поставлена в очередь%s: %s", bug_id, tag,
+                     " (разрешен дубликат ветки)" if allow_duplicate else "", detail)
+        if not queued:
+            return self.reply(200, {"status": "duplicate", "bug": bug_id, "tags": tags})
         # TFS ждет ответ недолго и повторяет запрос при ошибке, поэтому отвечаем сразу, а исправление идет в фоне.
-        self.reply(202, {"status": "queued", "bug": bug_id, DUPLICATE_PARAM: allow_duplicate})
+        self.reply(202, {"status": "queued", "bug": bug_id, "tags": queued, DUPLICATE_PARAM: allow_duplicate})
 
     def query_flag(self, name: str) -> bool:
         """Логический параметр query string: ?name, ?name=1, ?name=true или ?name=yes."""
@@ -234,18 +292,11 @@ class HookHandler(BaseHTTPRequestHandler):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--repo-path", required=True, help="Путь до репозитория решения")
-    p.add_argument("--extra-tag", default=DEFAULT_EXTRA_TAG,
-                   help=f"Тег, который должен стоять на карточке вместе с {TRIGGER_TAG} (по умолчанию "
-                        f"{DEFAULT_EXTRA_TAG}; пустая строка - достаточно одного {TRIGGER_TAG})")
-    p.add_argument("--claude-rule", type=Path,
-                   help="Путь до файла с правилом написания кода, которое Claude учитывает при исправлении")
+    p.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
+                   help=f"Путь до конфига с тегами репозиториев (по умолчанию {DEFAULT_CONFIG.name} рядом с server.py)")
     p.add_argument("--verbose", action="store_true", help="Писать в лог пропущенные события и HTTP-запросы")
     cfg = p.parse_args()
-    cfg.required_tags = parse_tags(TRIGGER_TAG) | parse_tags(cfg.extra_tag)
-    if cfg.claude_rule:
-        cfg.claude_rule = cfg.claude_rule.resolve()
-        read_rule(cfg.claude_rule)  # Ошибка в пути видна сразу при запуске, а не при первом баге
+    repos = read_repos(cfg.config.resolve())
     cfg.credentials = os.environ.get("BUGDAN_HOOK_USER", ""), os.environ.get("BUGDAN_HOOK_PASSWORD", "")
 
     # Консоль службы Windows пишет в кодировке ANSI, поэтому основной лог дублируется в файл в UTF-8.
@@ -257,9 +308,9 @@ def main():
     if not cfg.credentials[1]:
         log.warning("BUGDAN_HOOK_PASSWORD не задан: запросы принимаются без проверки Basic-аутентификации")
 
-    server = HookServer((HOST, PORT), cfg, Runner(cfg.repo_path, LOG_DIR, cfg.claude_rule))
-    log.info("Жду события на http://%s:%s%s, репозиторий %s, теги %s, правило Claude %s", HOST, PORT, HOOK_PATH,
-             cfg.repo_path, ", ".join(sorted(cfg.required_tags)), cfg.claude_rule or "не задано")
+    server = HookServer((HOST, PORT), cfg, Runner(repos, LOG_DIR))
+    log.info("Жду события на http://%s:%s%s, тег %s и теги репозиториев: %s", HOST, PORT, HOOK_PATH, TRIGGER_TAG,
+             "; ".join(f"{t} -> {r.path} (правило Claude {r.rule or 'не задано'})" for t, r in repos.items()))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
