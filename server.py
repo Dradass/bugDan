@@ -1,9 +1,9 @@
 """HTTP-сервер для service hook TFS: исправляет баг (bug_fixer.fix_bug), когда на его карточке оказываются
-оба тега AIFix и Applied.
+тег AIFix и дополнительный тег (--extra-tag, по умолчанию Applied).
 
 Подписка в TFS: Project Settings -> Service hooks -> Web Hooks, событие "Work item updated",
-фильтры: тег AIFix, измененное поле Tags. Наличие обоих тегов проверяет сервер (REQUIRED_TAGS).
-    python server.py --repo-path D:\\Projects\\master\\RX
+фильтры: тег AIFix, измененное поле Tags. Дополнительный тег проверяет сервер.
+    python server.py --repo-path D:\\Projects\\master\\RX [--extra-tag Applied]
 """
 import argparse, base64, hmac, json, logging, os, queue, threading, traceback
 from contextlib import redirect_stderr, redirect_stdout
@@ -18,7 +18,8 @@ HERE = Path(__file__).resolve().parent
 HOST, PORT = "0.0.0.0", 8080
 HOOK_PATH = "/propose-fix"  # Путь, на который TFS отправляет события
 WORK_ITEM_TYPES = {"bug"}  # Типы карточек
-REQUIRED_TAGS = {"aifix", "applied"}  # Теги, которые все должны стоять на карточке
+TRIGGER_TAG = "AIFix"  # Тег, по которому срабатывает подписка TFS
+DEFAULT_EXTRA_TAG = "Applied"  # Дополнительный тег по умолчанию (--extra-tag)
 LOG_DIR = HERE / "logs"  # Логи исправлений и общий лог сервера
 MAX_BODY = 5 * 1024 * 1024
 DUPLICATE_PARAM = "allow-duplicate"  # ?allow-duplicate=1 в URL: создать новую ветку, даже если ветка бага уже есть
@@ -41,17 +42,17 @@ def tags_change(fields: dict) -> tuple[set[str], set[str]] | None:
     return parse_tags(change.get("oldValue")), parse_tags(change.get("newValue"))
 
 
-def tags_skip_reason(fields: dict) -> str | None:
+def tags_skip_reason(fields: dict, required: set[str]) -> str | None:
     """Причина не запускать исправление по тегам или None. Запуск - когда в этом изменении на карточке
-    впервые оказались все теги REQUIRED_TAGS (неважно, какой из них поставлен последним)."""
+    впервые оказались все теги required (неважно, какой из них поставлен последним)."""
     change = tags_change(fields)
     if change is None:
         return "теги не менялись"
     old, new = change
-    if missing := REQUIRED_TAGS - new:
+    if missing := required - new:
         return "нет тегов " + ", ".join(sorted(missing))
-    if REQUIRED_TAGS <= old:
-        return "теги " + ", ".join(sorted(REQUIRED_TAGS)) + " стояли и до изменения"
+    if required <= old:
+        return "теги " + ", ".join(sorted(required)) + " стояли и до изменения"
     return None
 
 
@@ -63,7 +64,7 @@ def bug_url(resource: dict) -> str:
     return f"{collection}/{quote(project)}/_workitems/edit/{resource['workItemId']}"
 
 
-def select_bug(event: dict) -> tuple[int | None, str]:
+def select_bug(event: dict, required_tags: set[str]) -> tuple[int | None, str]:
     """Возвращает (номер карточки, ссылка), если событие должно запустить исправление, иначе (None, причина пропуска)."""
     if event.get("eventType") != "workitem.updated":
         return None, f"событие {event.get('eventType')!r} не обрабатывается"
@@ -72,7 +73,7 @@ def select_bug(event: dict) -> tuple[int | None, str]:
     item_type = fields.get("System.WorkItemType", "")
     if item_type.lower() not in WORK_ITEM_TYPES:
         return None, f"тип карточки {item_type!r} не обрабатывается"
-    if reason := tags_skip_reason(resource.get("fields") or {}):
+    if reason := tags_skip_reason(resource.get("fields") or {}, required_tags):
         return None, reason
     try:
         return int(resource["workItemId"]), bug_url(resource)
@@ -175,7 +176,7 @@ class HookHandler(BaseHTTPRequestHandler):
 
     def propose_fix(self, event: dict):
         """Событие service hook TFS: ставит карточку в очередь на исправление."""
-        bug_id, detail = select_bug(event)
+        bug_id, detail = select_bug(event, self.server.cfg.required_tags)
         if bug_id is None:
             log.debug("Событие пропущено: %s", detail)
             return self.reply(200, {"status": "ignored", "reason": detail})
@@ -223,8 +224,12 @@ class HookHandler(BaseHTTPRequestHandler):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--repo-path", required=True, help="Путь до репозитория решения")
+    p.add_argument("--extra-tag", default=DEFAULT_EXTRA_TAG,
+                   help=f"Тег, который должен стоять на карточке вместе с {TRIGGER_TAG} (по умолчанию "
+                        f"{DEFAULT_EXTRA_TAG}; пустая строка - достаточно одного {TRIGGER_TAG})")
     p.add_argument("--verbose", action="store_true", help="Писать в лог пропущенные события и HTTP-запросы")
     cfg = p.parse_args()
+    cfg.required_tags = parse_tags(TRIGGER_TAG) | parse_tags(cfg.extra_tag)
     cfg.credentials = os.environ.get("BUGDAN_HOOK_USER", ""), os.environ.get("BUGDAN_HOOK_PASSWORD", "")
 
     # Консоль службы Windows пишет в кодировке ANSI, поэтому основной лог дублируется в файл в UTF-8.
@@ -237,7 +242,8 @@ def main():
         log.warning("BUGDAN_HOOK_PASSWORD не задан: запросы принимаются без проверки Basic-аутентификации")
 
     server = HookServer((HOST, PORT), cfg, Runner(cfg.repo_path, LOG_DIR))
-    log.info("Жду события на http://%s:%s%s, репозиторий %s", HOST, PORT, HOOK_PATH, cfg.repo_path)
+    log.info("Жду события на http://%s:%s%s, репозиторий %s, теги %s", HOST, PORT, HOOK_PATH, cfg.repo_path,
+             ", ".join(sorted(cfg.required_tags)))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
