@@ -303,13 +303,14 @@ def find_base_branch(item: WorkItem, repo_url: str, exists) -> tuple[str, str]:
     Порядок: родительская User Story/Feature (секция Development, затем комментарии),
     сама карточка (так же), иначе master. exists(имя) проверяет, что ветка есть в репозитории.
     """
-    s = _session()
+    # Репозиторий и карточки могут быть на разных серверах, а HttpNegotiateAuth запоминает хост
+    # первого запроса - поэтому для каждого сервера своя сессия.
     collection, project, repo = parse_git_url(repo_url)
-    r = s.get(f"{collection}/{project}/_apis/git/repositories/{repo}", params={"api-version": API_VERSION})
+    r = _session().get(f"{collection}/{project}/_apis/git/repositories/{repo}", params={"api-version": API_VERSION})
     r.raise_for_status()
     repo_id = r.json()["id"]
 
-    parent = _find_parent(s, item)
+    parent = _find_parent(_session(), item)
     for card in ([parent] if parent else []) + [item]:
         label = f"{card.type} #{card.id}"
         for branch in _linked_branches(card.relations, repo_id):
