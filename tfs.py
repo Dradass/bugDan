@@ -144,9 +144,16 @@ def parse_git_url(url: str) -> tuple[str, str, str]:
 
 
 def create_pull_request(repo_url: str, source_branch: str, target_branch: str,
-                        title: str, description: str, draft: bool = True) -> str:
-    """Создает pull request и возвращает ссылку на него."""
+                        title: str, description: str, template: str = "", draft: bool = True) -> str:
+    """Создает pull request и возвращает ссылку на него.
+    template - шаблон описания из репозитория, добавляется после description. Если описание не помещается
+    в лимит TFS, в первую очередь обрезается description, но ему остается не меньше половины лимита."""
     collection, project, repo = parse_git_url(repo_url)
+    tail = "\n\n---\n\n" + template.strip() if template.strip() else ""
+    limit = max(PR_DESCRIPTION_LIMIT - len(tail), PR_DESCRIPTION_LIMIT // 2)
+    if len(description) > limit:
+        description = description[:limit - 20].rstrip() + "\n\n[...обрезано]"
+    description += tail
     if len(description) > PR_DESCRIPTION_LIMIT:
         description = description[:PR_DESCRIPTION_LIMIT - 20].rstrip() + "\n\n[...обрезано]"
     r = _session().post(

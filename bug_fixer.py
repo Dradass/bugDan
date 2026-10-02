@@ -167,6 +167,26 @@ def free_branch_name(name: str, taken: set[str]) -> str:
     return candidate
 
 
+PR_TEMPLATE_DIRS = (".azuredevops/", ".vsts/", "docs/", "")  # порядок поиска шаблонов в TFS
+
+
+def pr_template(repo: Path, sha: str, target: str) -> str:
+    """Шаблон описания pull request, который TFS подставляет при создании PR в веб-интерфейсе
+    (через REST API он не применяется). Сначала ищется шаблон целевой ветки
+    (<папка>/pull_request_template/branches/<ветка>.md), затем общий (<папка>/pull_request_template.md).
+    Берется из коммита sha; пустая строка, если шаблона нет."""
+    files = {f.lower(): f for f in git("ls-tree", "-r", "--name-only", sha, cwd=repo).splitlines()}
+    branch_names = dict.fromkeys([target.lower(), target.split("/")[0].lower()])
+    candidates = [f"{d}pull_request_template/branches/{b}{ext}"
+                  for d in PR_TEMPLATE_DIRS for b in branch_names for ext in (".md", ".txt")]
+    candidates += [f"{d}pull_request_template{ext}" for d in PR_TEMPLATE_DIRS for ext in (".md", ".txt")]
+    path = next((files[c] for c in candidates if c in files), None)
+    if path is None:
+        return ""
+    print(f"Шаблон описания pull request: {path}", file=sys.stderr)
+    return git("show", f"{sha}:{path}", cwd=repo).lstrip("﻿")
+
+
 def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, base_sha: str, remote: str,
                       bug_id: int, title: str, bug: str, area: str, allow_duplicate: bool = False,
                       code_rules: str | None = None) -> None:
@@ -226,7 +246,13 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     cleanup(delete_branch=False)
 
     description = f"Карточка: {bug_url}\n\nИсправление предложено Claude.\n\n{summary}"
-    pr_url = create_pull_request(repo_url, new_branch, base, f"#{bug_id} {title}", description, draft=True)
+    try:
+        template = pr_template(repo_path, base_sha, base)
+    except RuntimeError as e:
+        print(f"Не удалось прочитать шаблон описания pull request: {e}", file=sys.stderr)
+        template = ""
+    pr_url = create_pull_request(repo_url, new_branch, base, f"#{bug_id} {title}", description,
+                                 template=template, draft=True)
     print(f"Pull request {new_branch} -> {base}: {pr_url}", file=sys.stderr)
 
     # Pull request уже создан, поэтому ошибка комментария не прерывает работу, а только выводится в лог.
