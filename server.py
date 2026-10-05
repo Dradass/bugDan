@@ -8,7 +8,7 @@
 """
 import argparse, base64, hmac, json, logging, os, queue, re, threading, traceback
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime
+from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import NamedTuple
@@ -22,7 +22,10 @@ HOOK_PATH = "/propose-fix"  # Путь, на который TFS отправля
 WORK_ITEM_TYPES = {"bug"}  # Типы карточек
 TRIGGER_TAG = "AIFix"  # Тег, по которому срабатывает подписка TFS
 DEFAULT_CONFIG = HERE / "config.json"  # Конфиг с тегами репозиториев (--config)
-LOG_DIR = HERE / "logs"  # Логи исправлений и общий лог сервера
+LOG_DIR = HERE / "logs"
+FIX_LOG_DIR = LOG_DIR / "fix_logs"  # Логи исправлений, по файлу на запуск
+SERVER_LOG_DIR = LOG_DIR / "server"  # Общий лог сервера, по файлу на день
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"  # Дата и время в начале каждой строки логов
 MAX_BODY = 5 * 1024 * 1024
 GUID_RE = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
 DUPLICATE_PARAM ="allow-duplicate"  # ?allow-duplicate=1 в URL: создать новую ветку, даже если ветка бага уже есть
@@ -104,6 +107,58 @@ def read_rule(path: Path) -> str:
         raise SystemExit(f"Не удалось прочитать файл правила {path}: {e}")
 
 
+class TimestampFormatter(logging.Formatter):
+    """Ставит дату и время в начало каждой строки записи, в том числе строк traceback."""
+
+    def __init__(self):
+        super().__init__("%(levelname)s %(message)s")
+
+    def format(self, record):
+        stamp = datetime.fromtimestamp(record.created).strftime(TIME_FORMAT)
+        return "\n".join(f"{stamp} {line}" for line in super().format(record).splitlines())
+
+
+class DailyFileHandler(logging.FileHandler):
+    """Пишет лог в <папка>/<ГГГГ-ММ-ДД>.log: каждый день в отдельный файл."""
+
+    def __init__(self, directory: Path):
+        directory.mkdir(parents=True, exist_ok=True)
+        self.directory, self.day = directory, date.today()
+        super().__init__(self._path(self.day), encoding="utf-8")
+
+    def _path(self, day: date) -> Path:
+        return self.directory / f"{day:%Y-%m-%d}.log"
+
+    def emit(self, record):
+        # emit вызывается под блокировкой обработчика, поэтому смена файла не пересекается с записью из других потоков.
+        day = datetime.fromtimestamp(record.created).date()
+        if day != self.day:
+            if self.stream:
+                self.stream.close()
+                self.stream = None  # FileHandler откроет новый файл при записи
+            self.day, self.baseFilename = day, str(self._path(day))
+        super().emit(record)
+
+
+class TimestampWriter:
+    """Файл для redirect_stdout: в начало каждой строки ставит дату и время, когда она начала выводиться."""
+
+    def __init__(self, f):
+        self.f, self.line_start = f, True
+
+    def write(self, text: str) -> int:
+        for line in text.splitlines(keepends=True):
+            if self.line_start:
+                self.f.write(f"{datetime.now():{TIME_FORMAT}} ")
+            self.f.write(line)
+            self.line_start = line.endswith("\n")
+        self.f.flush()  # Лог запуска можно смотреть, пока он идет
+        return len(text)
+
+    def flush(self):
+        self.f.flush()
+
+
 class Repo(NamedTuple):
     path: Path  # Путь до репозитория решения
     rule: Path | None  # Файл с правилом написания кода для Claude; None - без правила
@@ -176,7 +231,7 @@ class Runner:
         log_file = self.log_dir / f"{bug_id}-{tag}-{datetime.now():%Y%m%d-%H%M%S}.log"
         log.info("Карточка %s (%s): запуск в %s, лог %s", bug_id, tag, repo.path, log_file)
         # Вывод bug_fixer (print) пишется в лог запуска. Запуски идут по одному, поэтому подмена stdout не мешает другим.
-        with log_file.open("w", encoding="utf-8") as f, redirect_stdout(f), redirect_stderr(f):
+        with log_file.open("w", encoding="utf-8") as f, redirect_stdout(out := TimestampWriter(f)), redirect_stderr(out):
             print(f"bug-url: {url}\ntag: {tag}\nrepo-path: {repo.path}\nallow-duplicate: {allow_duplicate}\n"
                   f"claude-rule: {repo.rule or '-'}\n")
             try:
@@ -300,15 +355,14 @@ def main():
     cfg.credentials = os.environ.get("BUGDAN_HOOK_USER", ""), os.environ.get("BUGDAN_HOOK_PASSWORD", "")
 
     # Консоль службы Windows пишет в кодировке ANSI, поэтому основной лог дублируется в файл в UTF-8.
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(level=logging.DEBUG if cfg.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s",
-                        handlers=[logging.StreamHandler(),
-                                  logging.FileHandler(LOG_DIR / "server.log", encoding="utf-8")])
+    handlers = [logging.StreamHandler(), DailyFileHandler(SERVER_LOG_DIR)]
+    for handler in handlers:
+        handler.setFormatter(TimestampFormatter())
+    logging.basicConfig(level=logging.DEBUG if cfg.verbose else logging.INFO, handlers=handlers)
     if not cfg.credentials[1]:
         log.warning("BUGDAN_HOOK_PASSWORD не задан: запросы принимаются без проверки Basic-аутентификации")
 
-    server = HookServer((HOST, PORT), cfg, Runner(repos, LOG_DIR))
+    server = HookServer((HOST, PORT), cfg, Runner(repos, FIX_LOG_DIR))
     log.info("Жду события на http://%s:%s%s, тег %s и теги репозиториев: %s", HOST, PORT, HOOK_PATH, TRIGGER_TAG,
              "; ".join(f"{t} -> {r.path} (правило Claude {r.rule or 'не задано'})" for t, r in repos.items()))
     try:
