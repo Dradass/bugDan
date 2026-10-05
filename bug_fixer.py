@@ -28,7 +28,11 @@ FIX_TASK = """Задача:
 2. Внеси исправление прямо в файлы репозитория. Изменения должны быть минимальными
    и в стиле окружающего кода. Не создавай вспомогательных файлов, не делай коммитов.
 3. В ответе кратко опиши: причину бага, что изменено (файлы), риски.
-   Этот текст станет описанием коммита, поэтому пиши без markdown-заголовков."""
+   Этот текст станет описанием коммита, поэтому пиши без markdown-заголовков.
+Если исправление в коде не требуется (например, проблема в данных, настройках или окружении, поведение
+соответствует замыслу или баг уже исправлен), не меняй файлы, а в ответе кратко объясни, почему исправление
+в коде не нужно и что можно сделать вместо него. Этот текст станет комментарием в карточке бага,
+поэтому пиши без markdown-разметки."""
 
 
 def git(*args, cwd, input: str | None = None) -> str:
@@ -199,6 +203,12 @@ def move_card(bug_url: str, column: str, only_from: str | None = None) -> None:
         print(f"Внимание: не удалось перенести карточку в столбец {column}: {e}", file=sys.stderr)
 
 
+def no_fix_comment(summary: str) -> str:
+    """HTML комментария в карточку, когда Claude не внес изменений: его объяснение, почему исправление в коде не нужно."""
+    text = "<br>".join(html.escape(line) for line in summary.splitlines())
+    return f"<b>Исправление в коде не требуется.</b><br>{text}"
+
+
 def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, base_sha: str, remote: str,
                       item: WorkItem, allow_duplicate: bool = False, code_rules: str | None = None) -> None:
     bug_id, title, bug = item.id, item.title, item.text
@@ -248,6 +258,12 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
 
     if not git("status", "--porcelain", cwd=worktree):
         cleanup(delete_branch=True)
+        try:
+            add_workitem_comment(bug_url, no_fix_comment(summary))
+            print(f"В карточку #{bug_id} добавлен комментарий о том, что исправление в коде не требуется.",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"Внимание: {e}", file=sys.stderr)
         sys.exit("Claude не внес изменений в файлы, ветка не создана.")
 
     git("add", "-A", cwd=worktree)
