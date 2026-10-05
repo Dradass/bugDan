@@ -172,6 +172,89 @@ def create_pull_request(repo_url: str, source_branch: str, target_branch: str,
     return f"{collection}/{project}/_git/{repo}/pullrequest/{r.json()['pullRequestId']}"
 
 
+def add_required_reviewer(pr_url: str, person: dict) -> None:
+    """Добавляет в pull request обязательного рецензента. person - IdentityRef из карточки (WorkItem.assigned_to)."""
+    collection, project, repo = parse_git_url(pr_url)
+    pr_id = pr_url.rstrip("/").rsplit("/", 1)[-1]
+    s = _session()
+    reviewer_id = person.get("id")
+    if not reviewer_id:  # Старые версии TFS отдают в поле карточки только строку "Имя <DOMAIN\login>"
+        r = s.get(f"{collection}/_apis/identities",
+                  params={"api-version": API_VERSION, "searchFilter": "General", "filterValue": person["uniqueName"]})
+        if not r.ok:
+            raise RuntimeError(f"Не удалось найти пользователя {person['uniqueName']}: "
+                               f"HTTP {r.status_code} {r.text[:500]}")
+        found = r.json().get("value") or []
+        if not found:
+            raise RuntimeError(f"Пользователь {person['uniqueName']} не найден в TFS")
+        reviewer_id = found[0]["id"]
+    r = s.put(f"{collection}/{project}/_apis/git/repositories/{repo}/pullRequests/{pr_id}/reviewers/{reviewer_id}",
+              params={"api-version": API_VERSION}, json={"vote": 0, "isRequired": True})
+    if not r.ok:
+        raise RuntimeError(f"Не удалось добавить рецензента {person.get('displayName')} в pull request {pr_id}: "
+                           f"HTTP {r.status_code} {r.text[:500]}")
+
+
+def _team_board(s: requests.Session, collection: str, project: str, team: str | None, fields: dict) -> dict | None:
+    """Доска команды team (None - команда проекта по умолчанию), на которой находится карточка:
+    в карточке заполнено поле столбца этой доски (WEF_<guid>_Kanban.Column)."""
+    base = f"{collection}/{project}" + (f"/{team}" if team else "")
+    r = s.get(f"{base}/_apis/work/boards", params={"api-version": API_VERSION})
+    if r.status_code == 404:  # Команды с таким именем нет
+        return None
+    r.raise_for_status()
+    for ref in r.json().get("value", []):
+        board = s.get(ref["url"], params={"api-version": API_VERSION})
+        board.raise_for_status()
+        board = board.json()
+        column_field = ((board.get("fields") or {}).get("columnField") or {}).get("referenceName")
+        if column_field and fields.get(column_field):
+            return board
+    return None
+
+
+def move_to_board_column(url: str, column: str, only_from: str | None = None) -> str:
+    """Переносит карточку в столбец column доски ее команды; состояние карточки меняется на связанное со столбцом.
+    only_from - переносить, только если карточка сейчас в этом столбце. Возвращает итог для лога."""
+    collection, _, item_id = parse_workitem_url(url)
+    s = _session()
+    fields = _get_item(s, collection, item_id)["fields"]
+    project = fields["System.TeamProject"]
+    # Команда - из Area карточки, а если такой команды нет или карточки нет на ее досках - команда по умолчанию.
+    teams = dict.fromkeys([area_team(fields.get("System.AreaPath", "")), None])
+    board = next((b for t in teams if (b := _team_board(s, collection, project, t, fields))), None)
+    if board is None:
+        raise RuntimeError(f"Не найдена доска, на которой находится карточка #{item_id}")
+
+    board_fields = board["fields"]
+    column_field = board_fields["columnField"]["referenceName"]
+    current = fields.get(column_field, "")
+    if current.lower() == column.lower():
+        return f"карточка #{item_id} уже в столбце {current}"
+    if only_from and current.lower() != only_from.lower():
+        return f"карточка #{item_id} в столбце {current}, а не {only_from}, - не переносится"
+    target = next((c for c in board.get("columns", []) if c["name"].lower() == column.lower()), None)
+    if target is None:
+        raise RuntimeError(f"На доске {board.get('name')} нет столбца {column}")
+
+    ops = [{"op": "add", "path": f"/fields/{column_field}", "value": target["name"]}]
+    done_field = (board_fields.get("doneField") or {}).get("referenceName")
+    if done_field and target.get("isSplit"):  # В разделенном столбце карточка попадает в Doing
+        ops.append({"op": "add", "path": f"/fields/{done_field}", "value": False})
+    state = (target.get("stateMappings") or {}).get(fields.get("System.WorkItemType"))
+    if state == fields.get("System.State"):
+        state = None
+    if state:
+        ops.append({"op": "add", "path": "/fields/System.State", "value": state})
+    r = s.patch(f"{collection}/_apis/wit/workitems/{item_id}", params={"api-version": API_VERSION},
+                data=json.dumps(ops), headers={"Content-Type": "application/json-patch+json"})
+    if not r.ok:
+        raise RuntimeError(f"Не удалось перенести карточку #{item_id} в столбец {target['name']}: "
+                           f"HTTP {r.status_code} {r.text[:500]}")
+    return (f"карточка #{item_id} перенесена из столбца {current} в {target['name']}"
+            + (f", состояние {state}" if state else ""))
+
+
 def add_workitem_comment(url: str, html: str) -> None:
     """Добавляет комментарий (HTML) в карточку по ссылке на нее."""
     collection, _, item_id = parse_workitem_url(url)
@@ -197,6 +280,18 @@ class WorkItem:
     relations: list[dict]
     comments: list[str]  # текст комментариев, от старых к новым
     area: str = ""  # System.AreaPath: SmartInstruments\Vega
+    assigned_to: dict | None = None  # IdentityRef ответственного (System.AssignedTo); None - не назначен
+
+
+def _identity_ref(value) -> dict | None:
+    """IdentityRef из поля карточки. В API 5.0 это объект, в старых версиях TFS - строка "Имя <DOMAIN\\login>"."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    m = re.fullmatch(r"\s*(.*?)\s*<([^<>]+)>\s*", value)
+    name, unique = (m.group(1), m.group(2)) if m else (value.strip(), value.strip())
+    return {"displayName": name, "uniqueName": unique}
 
 
 def _get_item(s: requests.Session, collection: str, item_id: int) -> dict:
@@ -248,7 +343,8 @@ def load_workitem(url: str, with_comments: bool = True) -> WorkItem:
                     project=project,
                     relations=item.get("relations") or [],
                     comments=[text for _, text in comments],
-                    area=fields.get("System.AreaPath", ""))
+                    area=fields.get("System.AreaPath", ""),
+                    assigned_to=_identity_ref(fields.get("System.AssignedTo")))
 
 
 # Типы родительских карточек, в которых ищется ветка разработки.

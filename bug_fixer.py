@@ -1,10 +1,14 @@
 import html, json, os, re, shutil, subprocess, sys
 from pathlib import Path
 
-from tfs import add_workitem_comment, area_team, create_pull_request, find_base_branch, load_workitem, parse_team
+from tfs import (WorkItem, add_required_reviewer, add_workitem_comment, area_team, create_pull_request,
+                 find_base_branch, load_workitem, move_to_board_column, parse_team)
 
 MODEL = "claude-opus-5"
 SLUG_MODEL = "claude-haiku-4-5"  # Модель для постфикса имени ветки по сути бага
+
+# Столбцы доски: карточку из TODO при взятии в работу переносим в Development.
+TODO_COLUMN, DEVELOPMENT_COLUMN = "TODO", "Development"
 
 BUG_BLOCK = """Ты работаешь в репозитории {repo} (ветка {branch}).
 Описание бага:
@@ -23,7 +27,7 @@ FIX_TASK = """Задача:
 1. Найди в коде причину бага.
 2. Внеси исправление прямо в файлы репозитория. Изменения должны быть минимальными
    и в стиле окружающего кода. Не создавай вспомогательных файлов, не делай коммитов.
-3. В ответе кратко опиши: причину бага, что изменено (файлы), риски и что проверить тестами.
+3. В ответе кратко опиши: причину бага, что изменено (файлы), риски.
    Этот текст станет описанием коммита, поэтому пиши без markdown-заголовков."""
 
 
@@ -187,11 +191,19 @@ def pr_template(repo: Path, sha: str, target: str) -> str:
     return git("show", f"{sha}:{path}", cwd=repo).lstrip("﻿")
 
 
+def move_card(bug_url: str, column: str, only_from: str | None = None) -> None:
+    """Переносит карточку в столбец доски. Ошибка не прерывает работу, а только выводится в лог."""
+    try:
+        print(f"Доска: {move_to_board_column(bug_url, column, only_from)}.", file=sys.stderr)
+    except Exception as e:
+        print(f"Внимание: не удалось перенести карточку в столбец {column}: {e}", file=sys.stderr)
+
+
 def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, base_sha: str, remote: str,
-                      bug_id: int, title: str, bug: str, area: str, allow_duplicate: bool = False,
-                      code_rules: str | None = None) -> None:
+                      item: WorkItem, allow_duplicate: bool = False, code_rules: str | None = None) -> None:
+    bug_id, title, bug = item.id, item.title, item.text
     # Проверяем по префиксу и номеру бага до запроса постфикса у Claude, чтобы не тратить на него вызов.
-    new_branch = f"{branch_prefix(bug_url, area, base)}/{bug_id}"
+    new_branch = f"{branch_prefix(bug_url, item.area, base)}/{bug_id}"
     found = existing_bug_branches(repo_path, remote, new_branch)
     listing = "\n  ".join(f"{n} ({where})" for n, where in found)
     if found and not allow_duplicate:
@@ -207,6 +219,8 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     worktree = repo_path.parent / f"{repo_path.name}-ai" / str(bug_id)
     if worktree.exists():
         sys.exit(f"Папка {worktree} уже существует, удалите ее.")
+
+    move_card(bug_url, DEVELOPMENT_COLUMN, only_from=TODO_COLUMN)  # Баг взят в работу
 
     # Новая ветка создается от последнего коммита базовой ветки на сервере в отдельной папке (git worktree).
     # Рабочая копия и ее текущая ветка при этом не меняются.
@@ -255,7 +269,16 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
                                  template=template, draft=True)
     print(f"Pull request {new_branch} -> {base}: {pr_url}", file=sys.stderr)
 
-    # Pull request уже создан, поэтому ошибка комментария не прерывает работу, а только выводится в лог.
+    # Pull request уже создан, поэтому ошибки рецензента и комментария не прерывают работу, а только выводятся в лог.
+    if item.assigned_to:
+        try:
+            add_required_reviewer(pr_url, item.assigned_to)
+            print(f"Обязательный рецензент pull request: {item.assigned_to.get('displayName')}.", file=sys.stderr)
+        except Exception as e:
+            print(f"Внимание: {e}", file=sys.stderr)
+    else:
+        print(f"У карточки #{bug_id} нет ответственного, обязательный рецензент не добавлен.", file=sys.stderr)
+
     link = html.escape(pr_url)
     try:
         add_workitem_comment(bug_url, f'Исправление бага: <a href="{link}">{link}</a>')
@@ -279,5 +302,4 @@ def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False, code_ru
     print(f"Базовая ветка: {base} ({source})", file=sys.stderr)
 
     base_sha = fetch_branch(repo_path, remote, base)
-    fix_in_new_branch(bug_url, repo_path, repo_url, base, base_sha, remote, item.id, item.title, item.text, item.area,
-                      allow_duplicate, code_rules)
+    fix_in_new_branch(bug_url, repo_path, repo_url, base, base_sha, remote, item, allow_duplicate, code_rules)
