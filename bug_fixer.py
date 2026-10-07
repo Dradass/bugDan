@@ -2,8 +2,8 @@ import html, json, os, re, shutil, subprocess, sys
 from pathlib import Path
 from typing import NamedTuple
 
-from tfs import (WorkItem, add_required_reviewer, add_workitem_comment, area_team, create_pull_request,
-                 find_base_branch, load_workitem, move_to_board_column, parse_team)
+from tfs import (Attachment, WorkItem, add_required_reviewer, add_workitem_comment, area_team, create_pull_request,
+                 download_attachments, find_base_branch, load_workitem, move_to_board_column, parse_team)
 
 MODEL = "claude-opus-5"
 SLUG_MODEL = "claude-haiku-4-5"  # Модель для постфикса имени ветки по сути бага
@@ -11,11 +11,22 @@ SLUG_MODEL = "claude-haiku-4-5"  # Модель для постфикса име
 # Столбцы доски: карточку из TODO при взятии в работу переносим в Development.
 TODO_COLUMN, DEVELOPMENT_COLUMN = "TODO", "Development"
 
+MAX_ATTACHMENT_SIZE = 2 * 1024 * 1024  # Вложения карточки больше этого размера не скачиваются
+
 BUG_BLOCK = """Ты работаешь в репозитории {repo} (ветка {branch}).
 Описание бага:
 ---
 {bug}
 ---
+"""
+
+ATTACHMENTS_BLOCK = """К карточке приложены файлы. Они сохранены в папке {dir} (вне репозитория).
+Это часть описания карточки: изучи их и учитывай при работе. Файлы в этой папке не изменяй.
+{files}
+"""
+
+SKIPPED_ATTACHMENTS_BLOCK = """Эти вложения карточки получить не удалось, их содержимое тебе недоступно:
+{files}
 """
 
 RULES_BLOCK = """Правила написания кода, которые нужно соблюдать при исправлении:
@@ -104,8 +115,8 @@ def decode_console(data: bytes) -> str:
         return data.decode("oem" if sys.platform == "win32" else "latin-1", errors="replace")
 
 
-def ask_claude(repo_path: Path, prompt: str, model: str,
-               allow_edits: bool = False, tools: str | None = None, max_turns: int | None = None) -> dict:
+def ask_claude(repo_path: Path, prompt: str, model: str, allow_edits: bool = False, tools: str | None = None,
+               max_turns: int | None = None, add_dirs: list[Path] = ()) -> dict:
     claude = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or sys.exit("claude CLI не найден в PATH")
     if tools is None:
         tools = "Read,Grep,Glob,Edit,Write" if allow_edits else "Read,Grep,Glob"
@@ -117,6 +128,8 @@ def ask_claude(repo_path: Path, prompt: str, model: str,
     args += ["--allowedTools", tools] if tools else ["--tools", ""]
     if allow_edits:
         args += ["--permission-mode", "acceptEdits"]
+    for directory in add_dirs:  # Папки вне репозитория, к которым Claude получает доступ (вложения карточки)
+        args += ["--add-dir", str(directory)]
     proc = subprocess.run(args, input=prompt.encode("utf-8"), cwd=repo_path, capture_output=True)
     stdout = proc.stdout.decode("utf-8", errors="replace")
     try:
@@ -261,6 +274,16 @@ def no_fix_comment(summary: str, caption: str = BUG_TEXTS.no_change) -> str:
     return f"<b>{html.escape(caption)}</b><br>{text}"
 
 
+def attachments_block(directory: Path, attachments: list[Attachment]) -> str:
+    """Блок запроса Claude со списком вложений карточки: скачанные и те, что получить не удалось."""
+    saved = [f"- {a.path.name} ({a.size} байт)" for a in attachments if a.path]
+    skipped = [f"- {a.name}: {a.skipped}" for a in attachments if not a.path]
+    block = ATTACHMENTS_BLOCK.format(dir=directory, files="\n".join(saved)) if saved else ""
+    if skipped:
+        block += SKIPPED_ATTACHMENTS_BLOCK.format(files="\n".join(skipped))
+    return block
+
+
 def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, base_sha: str, remote: str,
                       item: WorkItem, allow_duplicate: bool = False, code_rules: str | None = None) -> None:
     bug_id, title, bug = item.id, item.title, item.text
@@ -280,8 +303,10 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     new_branch = free_branch_name(f"{new_branch}-{branch_slug(repo_path, title, bug, texts.slug)}", {n for n, _ in found})
 
     worktree = repo_path.parent / f"{repo_path.name}-ai" / str(bug_id)
-    if worktree.exists():
-        sys.exit(f"Папка {worktree} уже существует, удалите ее.")
+    attachments_dir = worktree.parent / f"{bug_id}-attachments"  # Вложения карточки, рядом с worktree
+    for folder in (worktree, attachments_dir):
+        if folder.exists():
+            sys.exit(f"Папка {folder} уже существует, удалите ее.")
 
     move_card(bug_url, DEVELOPMENT_COLUMN, only_from=TODO_COLUMN)  # Баг взят в работу
 
@@ -292,16 +317,23 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     git("worktree", "add", "-b", new_branch, str(worktree), base_sha, cwd=repo_path)
 
     def cleanup(delete_branch: bool):
+        shutil.rmtree(attachments_dir, ignore_errors=True)
         git("worktree", "remove", "--force", str(worktree), cwd=repo_path)
         if delete_branch:
             git("branch", "-D", new_branch, cwd=repo_path)
 
     try:
+        attachments = download_attachments(item, attachments_dir, MAX_ATTACHMENT_SIZE)
+        for a in attachments:
+            print(f"Вложение {a.name}: " + (f"сохранено в {a.path}" if a.path else f"не скачано, {a.skipped}"),
+                  file=sys.stderr)
         prompt = texts.block.format(repo=repo_url, branch=new_branch, bug=bug)
+        prompt += attachments_block(attachments_dir, attachments)
         if code_rules:
             prompt += RULES_BLOCK.format(rules=code_rules)
         prompt += texts.task
-        res = ask_claude(worktree, prompt, MODEL, allow_edits=True)
+        res = ask_claude(worktree, prompt, MODEL, allow_edits=True,
+                         add_dirs=[attachments_dir] if attachments_dir.exists() else [])
     except BaseException:
         cleanup(delete_branch=True)
         raise

@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
@@ -345,6 +346,57 @@ def load_workitem(url: str, with_comments: bool = True) -> WorkItem:
                     comments=[text for _, text in comments],
                     area=fields.get("System.AreaPath", ""),
                     assigned_to=_identity_ref(fields.get("System.AssignedTo")))
+
+
+@dataclass
+class Attachment:
+    name: str  # Имя файла во вложении карточки
+    size: int  # Размер в байтах (из связи карточки или по факту скачивания)
+    path: Path | None  # Куда сохранен; None - не скачан
+    skipped: str = ""  # Причина, по которой файл не скачан
+
+
+def _safe_name(name: str, used: set[str]) -> str:
+    """Имя файла без путей и недопустимых в Windows символов; при совпадении добавляется (2), (3)..."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", name).strip(" .") or "attachment"
+    stem, dot, ext = name.rpartition(".") if "." in name else (name, "", "")
+    candidate, n = name, 2
+    while candidate.lower() in used:
+        candidate = f"{stem} ({n}){dot}{ext}"
+        n += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def download_attachments(item: WorkItem, dest: Path, max_size: int) -> list[Attachment]:
+    """Скачивает вложения карточки (связи AttachedFile) размером до max_size байт в папку dest.
+    Вложения, которые больше или не скачались, возвращаются с причиной в skipped."""
+    s, used, result = _session(), set(), []
+    for rel in item.relations:
+        if rel.get("rel") != "AttachedFile":
+            continue
+        attrs = rel.get("attributes") or {}
+        name = attrs.get("name") or rel["url"].rstrip("/").rsplit("/", 1)[-1]
+        size = int(attrs.get("resourceSize") or 0)
+        if size > max_size:
+            result.append(Attachment(name, size, None, f"больше {max_size / 1024 / 1024:g} МБ"))
+            continue
+        try:
+            with s.get(rel["url"], params={"api-version": API_VERSION, "download": "true"}, stream=True) as r:
+                r.raise_for_status()
+                data = b""
+                for chunk in r.iter_content(64 * 1024):
+                    data += chunk
+                    if len(data) > max_size:  # Размер в связи может отличаться от фактического
+                        raise ValueError(f"больше {max_size / 1024 / 1024:g} МБ")
+        except (requests.RequestException, ValueError) as e:
+            result.append(Attachment(name, size, None, str(e)))
+            continue
+        dest.mkdir(parents=True, exist_ok=True)
+        path = dest / _safe_name(name, used)
+        path.write_bytes(data)
+        result.append(Attachment(name, len(data), path))
+    return result
 
 
 # Типы родительских карточек, в которых ищется ветка разработки.
