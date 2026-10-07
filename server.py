@@ -4,6 +4,9 @@
 
 Подписка в TFS: Project Settings -> Service hooks -> Web Hooks, событие "Work item updated",
 фильтры: тег AIFix, измененное поле Tags. Тег репозитория проверяет сервер.
+
+Endpoint /check-work-item принимает то же событие для измененного поля Board Column: для карточек с тегом AICheck
+выполняет проверку бага в зависимости от нового столбца или исправление при переносе в TODO (board_checker).
     python server.py [--config config.json]
 """
 import argparse, base64, hmac, json, logging, os, queue, re, threading, traceback
@@ -14,11 +17,13 @@ from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+from board_checker import CHECK_TAG, check_board_column
 from bug_fixer import fix_bug
 
 HERE = Path(__file__).resolve().parent
 HOST, PORT = "0.0.0.0", 8080
 HOOK_PATH = "/propose-fix"  # Путь, на который TFS отправляет события
+CHECK_PATH = "/check-work-item"  # Путь, на который TFS отправляет события переноса карточки по доске
 WORK_ITEM_TYPES = {"bug"}  # Типы карточек
 TRIGGER_TAG = "AIFix"  # Тег, по которому срабатывает подписка TFS
 DEFAULT_CONFIG = HERE / "config.json"  # Конфиг с тегами репозиториев (--config)
@@ -80,23 +85,53 @@ def bug_url(resource: dict) -> str:
     return f"{collection}/{quote(project)}/_workitems/edit/{resource['workItemId']}"
 
 
+def bug_resource(event: dict) -> tuple[dict, str | None]:
+    """resource события изменения карточки бага и причина пропуска, если событие не обрабатывается."""
+    if event.get("eventType") != "workitem.updated":
+        return {}, f"событие {event.get('eventType')!r} не обрабатывается"
+    resource = event.get("resource") or {}
+    item_type = ((resource.get("revision") or {}).get("fields") or {}).get("System.WorkItemType", "")
+    if item_type.lower() not in WORK_ITEM_TYPES:
+        return {}, f"тип карточки {item_type!r} не обрабатывается"
+    return resource, None
+
+
+def bug_id_url(resource: dict) -> tuple[int | None, str]:
+    """(номер карточки, ссылка) или (None, причина пропуска), если в событии нет данных карточки."""
+    try:
+        return int(resource["workItemId"]), bug_url(resource)
+    except (KeyError, TypeError, ValueError) as e:
+        return None, f"в событии нет данных карточки: {e!r}"
+
+
 def select_bug(event: dict, repo_tags: set[str]) -> tuple[int | None, str, list[str]]:
     """Возвращает (номер карточки, ссылка, теги репозиториев), если событие должно запустить исправление,
     иначе (None, причина пропуска, [])."""
-    if event.get("eventType") != "workitem.updated":
-        return None, f"событие {event.get('eventType')!r} не обрабатывается", []
-    resource = event.get("resource") or {}
-    fields = (resource.get("revision") or {}).get("fields") or {}
-    item_type = fields.get("System.WorkItemType", "")
-    if item_type.lower() not in WORK_ITEM_TYPES:
-        return None, f"тип карточки {item_type!r} не обрабатывается", []
+    resource, reason = bug_resource(event)
+    if reason:
+        return None, reason, []
     tags, reason = triggered_tags(resource.get("fields") or {}, repo_tags)
     if reason:
         return None, reason, []
-    try:
-        return int(resource["workItemId"]), bug_url(resource), tags
-    except (KeyError, TypeError, ValueError) as e:
-        return None, f"в событии нет данных карточки: {e!r}", []
+    bug_id, detail = bug_id_url(resource)
+    return bug_id, detail, tags if bug_id is not None else []
+
+
+def select_column_move(event: dict) -> tuple[int | None, str, str, set[str]]:
+    """Возвращает (номер карточки, ссылка, новый столбец доски, теги карточки), если карточку с тегом AICheck
+    перенесли в другой столбец, иначе (None, причина пропуска, "", set())."""
+    resource, reason = bug_resource(event)
+    if reason:
+        return None, reason, "", set()
+    change = (resource.get("fields") or {}).get("System.BoardColumn")
+    column = change.get("newValue") if isinstance(change, dict) else None
+    if not column:
+        return None, "столбец доски не менялся", "", set()
+    tags = parse_tags(((resource.get("revision") or {}).get("fields") or {}).get("System.Tags"))
+    if CHECK_TAG.lower() not in tags:
+        return None, f"нет тега {CHECK_TAG.lower()}", "", set()
+    bug_id, detail = bug_id_url(resource)
+    return bug_id, detail, column, tags
 
 
 def read_rule(path: Path) -> str:
@@ -177,7 +212,7 @@ def read_repos(path: Path) -> dict[str, Repo]:
     repos = {}
     for tag, item in tags.items():
         key = tag.strip().lower()
-        if not key or ";" in key or key == TRIGGER_TAG.lower() or key in repos:
+        if not key or ";" in key or key in {TRIGGER_TAG.lower(), CHECK_TAG.lower()} or key in repos:
             raise SystemExit(f"В {path} недопустимый или повторяющийся тег {tag!r}")
         if not isinstance(item, dict):
             raise SystemExit(f'В {path} для тега {tag!r} нужен словарь {{"repo": "<путь>", "rule": "<файл правила>"}}')
@@ -268,7 +303,7 @@ class HookHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Общие проверки POST-запросов; обработчик endpoint получает разобранное JSON-тело."""
-        handler = self.route({HOOK_PATH: self.propose_fix})
+        handler = self.route({HOOK_PATH: self.propose_fix, CHECK_PATH: self.check_work_item})
         if handler is None:
             return
         if not self.authorized():
@@ -294,24 +329,50 @@ class HookHandler(BaseHTTPRequestHandler):
 
     def propose_fix(self, event: dict):
         """Событие service hook TFS: ставит карточку в очередь на исправление."""
-        runner = self.server.runner
-        bug_id, detail, tags = select_bug(event, set(runner.repos))
+        bug_id, detail, tags = select_bug(event, set(self.server.runner.repos))
         if bug_id is None:
             log.debug("Событие пропущено: %s", detail)
             return self.reply(200, {"status": "ignored", "reason": detail})
         allow_duplicate = self.query_flag(DUPLICATE_PARAM)
-        queued = []
-        for tag in tags:
-            if not runner.submit(bug_id, detail, tag, allow_duplicate):
-                log.info("Карточка %s (%s) уже в очереди, повтор события пропущен", bug_id, tag)
-                continue
-            queued.append(tag)
-            log.info("Карточка %s (%s) поставлена в очередь%s: %s", bug_id, tag,
-                     " (разрешен дубликат ветки)" if allow_duplicate else "", detail)
+        queued = self.queue_fix(bug_id, detail, tags, allow_duplicate)
         if not queued:
             return self.reply(200, {"status": "duplicate", "bug": bug_id, "tags": tags})
         # TFS ждет ответ недолго и повторяет запрос при ошибке, поэтому отвечаем сразу, а исправление идет в фоне.
         self.reply(202, {"status": "queued", "bug": bug_id, "tags": queued, DUPLICATE_PARAM: allow_duplicate})
+
+    def check_work_item(self, event: dict):
+        """Событие service hook TFS о переносе карточки по доске: проверка бага или исправление (board_checker)."""
+        bug_id, detail, column, card_tags = select_column_move(event)
+        if bug_id is None:
+            log.debug("Событие пропущено: %s", detail)
+            return self.reply(200, {"status": "ignored", "reason": detail})
+        allow_duplicate = self.query_flag(DUPLICATE_PARAM)
+        repo_tags = set(self.server.runner.repos)
+
+        def fix(bug_id: int, url: str):
+            """Перенос в TODO: исправление в репозиториях тегов, которые стоят на карточке."""
+            tags = sorted(repo_tags & card_tags)
+            if not tags:
+                log.warning("Карточка %s перенесена в %s, но на ней нет ни одного из тегов репозиториев: %s",
+                            bug_id, column, ", ".join(sorted(repo_tags)))
+            self.queue_fix(bug_id, url, tags, allow_duplicate)
+
+        if not check_board_column(bug_id, detail, column, fix):
+            log.debug("Карточка %s перенесена в столбец %s, для него действий нет", bug_id, column)
+            return self.reply(200, {"status": "ignored", "reason": f"столбец {column!r} не обрабатывается"})
+        self.reply(200, {"status": "processed", "bug": bug_id, "column": column})
+
+    def queue_fix(self, bug_id: int, url: str, tags: list[str], allow_duplicate: bool) -> list[str]:
+        """Ставит карточку в очередь на исправление в репозиториях тегов; возвращает теги, по которым поставлена."""
+        queued = []
+        for tag in tags:
+            if not self.server.runner.submit(bug_id, url, tag, allow_duplicate):
+                log.info("Карточка %s (%s) уже в очереди, повтор события пропущен", bug_id, tag)
+                continue
+            queued.append(tag)
+            log.info("Карточка %s (%s) поставлена в очередь%s: %s", bug_id, tag,
+                     " (разрешен дубликат ветки)" if allow_duplicate else "", url)
+        return queued
 
     def query_flag(self, name: str) -> bool:
         """Логический параметр query string: ?name, ?name=1, ?name=true или ?name=yes."""
@@ -363,7 +424,8 @@ def main():
         log.warning("BUGDAN_HOOK_PASSWORD не задан: запросы принимаются без проверки Basic-аутентификации")
 
     server = HookServer((HOST, PORT), cfg, Runner(repos, FIX_LOG_DIR))
-    log.info("Жду события на http://%s:%s%s, тег %s и теги репозиториев: %s", HOST, PORT, HOOK_PATH, TRIGGER_TAG,
+    log.info("Жду события на http://%s:%s%s и %s, теги %s, %s и теги репозиториев: %s", HOST, PORT, HOOK_PATH,
+             CHECK_PATH, TRIGGER_TAG, CHECK_TAG,
              "; ".join(f"{t} -> {r.path} (правило Claude {r.rule or 'не задано'})" for t, r in repos.items()))
     try:
         server.serve_forever()
