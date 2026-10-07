@@ -256,9 +256,13 @@ def move_to_board_column(url: str, column: str, only_from: str | None = None) ->
             + (f", состояние {state}" if state else ""))
 
 
+COMMENT_PREFIX = "[Bugdan]: "  # Начало каждого комментария, который бот пишет в карточку
+
+
 def add_workitem_comment(url: str, html: str) -> None:
-    """Добавляет комментарий (HTML) в карточку по ссылке на нее."""
+    """Добавляет комментарий (HTML) в карточку по ссылке на нее. Комментарий начинается с COMMENT_PREFIX."""
     collection, _, item_id = parse_workitem_url(url)
+    html = COMMENT_PREFIX + html
     # POST .../comments появился только в API 5.1; запись в System.History работает во всех версиях TFS
     # и попадает в Discussion карточки как обычный комментарий.
     r = _session().patch(f"{collection}/_apis/wit/workitems/{item_id}",
