@@ -1,5 +1,6 @@
 import html, json, os, re, shutil, subprocess, sys
 from pathlib import Path
+from typing import NamedTuple
 
 from tfs import (WorkItem, add_required_reviewer, add_workitem_comment, area_team, create_pull_request,
                  find_base_branch, load_workitem, move_to_board_column, parse_team)
@@ -32,6 +33,24 @@ FIX_TASK = """Задача:
 Если исправление в коде не требуется (например, проблема в данных, настройках или окружении, поведение
 соответствует замыслу или баг уже исправлен), не меняй файлы, а в ответе кратко объясни, почему исправление
 в коде не нужно и что можно сделать вместо него. Этот текст станет комментарием в карточке бага,
+поэтому пиши без markdown-разметки."""
+
+TASK_BLOCK = """Ты работаешь в репозитории {repo} (ветка {branch}).
+Описание work item:
+---
+{bug}
+---
+"""
+
+WORK_TASK = """Задача:
+1. Изучи поставленную задачу в описании work item.
+2. Выполни ее, внеся изменения прямо в файлы репозитория. Изменения должны быть в стиле окружающего кода.
+   Не создавай вспомогательных файлов, не делай коммитов.
+3. В ответе кратко опиши: что сделано, что изменено (файлы), риски.
+   Этот текст станет описанием коммита, поэтому пиши без markdown-заголовков.
+Если изменения в коде не требуются (например, задача уже выполнена или решается настройками, данными
+или окружением) или описания недостаточно, чтобы ее выполнить, не меняй файлы, а в ответе кратко объясни
+причину и что нужно сделать или уточнить. Этот текст станет комментарием в карточке,
 поэтому пиши без markdown-разметки."""
 
 
@@ -120,6 +139,39 @@ SLUG_PROMPT = """Придумай короткое имя git-ветки для 
 {bug}
 ---"""
 
+TASK_SLUG_PROMPT = """Придумай короткое имя git-ветки для выполнения задачи.
+Требования: от 2 до 7 английских слов в kebab-case (только a-z, 0-9 и дефисы), передающих суть задачи,
+например add-price-column-to-order-export. Без номера задачи, без префиксов и кавычек.
+Ответь только именем, одной строкой.
+
+Название задачи: {title}
+Описание:
+---
+{bug}
+---"""
+
+
+class Texts(NamedTuple):
+    """Тексты, которые зависят от типа карточки: запросы к Claude, комментарии в карточку и описание pull request."""
+    block: str  # Описание карточки в запросе Claude
+    task: str  # Что Claude должен сделать
+    slug: str  # Запрос постфикса имени ветки
+    no_change: str  # Заголовок комментария, когда Claude не внес изменений
+    pr_note: str  # Строка в описании pull request
+    pr_link: str  # Подпись ссылки на pull request в комментарии карточки
+
+
+BUG_TEXTS = Texts(BUG_BLOCK, FIX_TASK, SLUG_PROMPT, "Исправление в коде не требуется.",
+                  "Исправление предложено Claude.", "Исправление бага")
+TASK_TEXTS = Texts(TASK_BLOCK, WORK_TASK, TASK_SLUG_PROMPT, "Изменения в коде не требуются.",
+                   "Доработка выполнена Claude.", "Доработка по задаче")
+
+
+def texts_for(item_type: str) -> Texts:
+    """Тексты для бага - про поиск причины и исправление, для остальных типов (User Story, Task) - про выполнение задачи."""
+    return BUG_TEXTS if item_type.lower() == "bug" else TASK_TEXTS
+
+
 TRANSLIT = dict(zip("абвгдеёзийклмнопрстуфхцыэ", "abvgdeeziyklmnoprstufhcye")) | {
     "ж": "zh", "ч": "ch", "ш": "sh", "щ": "sch", "ю": "yu", "я": "ya", "ъ": "", "ь": ""}
 
@@ -129,10 +181,10 @@ def kebab_words(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text)
 
 
-def branch_slug(repo_path: Path, title: str, bug: str) -> str:
-    """Постфикс ветки из 2-7 слов в kebab-case по сути бага. Если Claude не справился - транслит названия."""
+def branch_slug(repo_path: Path, title: str, bug: str, prompt: str = SLUG_PROMPT) -> str:
+    """Постфикс ветки из 2-7 слов в kebab-case по сути карточки. Если Claude не справился - транслит названия."""
     try:
-        res = ask_claude(repo_path, SLUG_PROMPT.format(title=title, bug=bug[:4000]), SLUG_MODEL,
+        res = ask_claude(repo_path, prompt.format(title=title, bug=bug[:4000]), SLUG_MODEL,
                          tools="", max_turns=1)
         words = kebab_words(res["result"].strip().splitlines()[0])
         if 2 <= len(words) <= 7:
@@ -203,15 +255,16 @@ def move_card(bug_url: str, column: str, only_from: str | None = None) -> None:
         print(f"Внимание: не удалось перенести карточку в столбец {column}: {e}", file=sys.stderr)
 
 
-def no_fix_comment(summary: str) -> str:
-    """HTML комментария в карточку, когда Claude не внес изменений: его объяснение, почему исправление в коде не нужно."""
+def no_fix_comment(summary: str, caption: str = BUG_TEXTS.no_change) -> str:
+    """HTML комментария в карточку, когда Claude не внес изменений: его объяснение, почему изменения в коде не нужны."""
     text = "<br>".join(html.escape(line) for line in summary.splitlines())
-    return f"<b>Исправление в коде не требуется.</b><br>{text}"
+    return f"<b>{html.escape(caption)}</b><br>{text}"
 
 
 def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, base_sha: str, remote: str,
                       item: WorkItem, allow_duplicate: bool = False, code_rules: str | None = None) -> None:
     bug_id, title, bug = item.id, item.title, item.text
+    texts = texts_for(item.type)
     # Проверяем по префиксу и номеру бага до запроса постфикса у Claude, чтобы не тратить на него вызов.
     new_branch = f"{branch_prefix(bug_url, item.area, base)}/{bug_id}"
     found = existing_bug_branches(repo_path, remote, new_branch)
@@ -224,7 +277,7 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
         print(f"Ветка для {new_branch} уже существует, создаю еще одну (разрешен дубликат):\n  {listing}",
               file=sys.stderr)
     # Постфикс от Claude может совпасть с уже существующей веткой - тогда добавляем -2, -3...
-    new_branch = free_branch_name(f"{new_branch}-{branch_slug(repo_path, title, bug)}", {n for n, _ in found})
+    new_branch = free_branch_name(f"{new_branch}-{branch_slug(repo_path, title, bug, texts.slug)}", {n for n, _ in found})
 
     worktree = repo_path.parent / f"{repo_path.name}-ai" / str(bug_id)
     if worktree.exists():
@@ -244,10 +297,10 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
             git("branch", "-D", new_branch, cwd=repo_path)
 
     try:
-        prompt = BUG_BLOCK.format(repo=repo_url, branch=new_branch, bug=bug)
+        prompt = texts.block.format(repo=repo_url, branch=new_branch, bug=bug)
         if code_rules:
             prompt += RULES_BLOCK.format(rules=code_rules)
-        prompt += FIX_TASK
+        prompt += texts.task
         res = ask_claude(worktree, prompt, MODEL, allow_edits=True)
     except BaseException:
         cleanup(delete_branch=True)
@@ -259,8 +312,8 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     if not git("status", "--porcelain", cwd=worktree):
         cleanup(delete_branch=True)
         try:
-            add_workitem_comment(bug_url, no_fix_comment(summary))
-            print(f"В карточку #{bug_id} добавлен комментарий о том, что исправление в коде не требуется.",
+            add_workitem_comment(bug_url, no_fix_comment(summary, texts.no_change))
+            print(f"В карточку #{bug_id} добавлен комментарий о том, что изменения в коде не требуются.",
                   file=sys.stderr)
         except Exception as e:
             print(f"Внимание: {e}", file=sys.stderr)
@@ -275,7 +328,7 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     print(f"Ветка {new_branch} запушена в {remote}.", file=sys.stderr)
     cleanup(delete_branch=False)
 
-    description = f"Карточка: {bug_url}\n\nИсправление предложено Claude.\n\n{summary}"
+    description = f"Карточка: {bug_url}\n\n{texts.pr_note}\n\n{summary}"
     try:
         template = pr_template(repo_path, base_sha, base)
     except RuntimeError as e:
@@ -297,14 +350,14 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
 
     link = html.escape(pr_url)
     try:
-        add_workitem_comment(bug_url, f'Исправление бага: <a href="{link}">{link}</a>')
+        add_workitem_comment(bug_url, f'{texts.pr_link}: <a href="{link}">{link}</a>')
         print(f"В карточку #{bug_id} добавлен комментарий со ссылкой на pull request.", file=sys.stderr)
     except Exception as e:
         print(f"Внимание: {e}", file=sys.stderr)
 
 
 def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False, code_rules: str | None = None) -> None:
-    """Исправляет баг в новой ветке: коммит, push и черновик pull request.
+    """Исправляет баг или выполняет задачу (User Story, Task) в новой ветке: коммит, push и черновик pull request.
     allow_duplicate - создать новую ветку, даже если ветка этого бага уже есть.
     code_rules - правила написания кода, которые Claude учитывает при исправлении.
     Ошибки завершаются через sys.exit("текст")."""

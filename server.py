@@ -1,5 +1,5 @@
-"""HTTP-сервер для service hook TFS: исправляет баг (bug_fixer.fix_bug), когда на его карточке оказываются
-тег AIFix и тег репозитория. Теги репозиториев, пути до них и необязательные файлы правил Claude задаются
+"""HTTP-сервер для service hook TFS: исправляет баг, User Story или Task (bug_fixer.fix_bug), когда на карточке
+оказываются тег AIFix и тег репозитория. Теги репозиториев, пути до них и необязательные файлы правил Claude задаются
 в config.json: {"tags": {"<тег>": {"repo": "<путь>", "rule": "<файл правила>"}}}.
 
 Подписка в TFS: Project Settings -> Service hooks -> Web Hooks, событие "Work item updated",
@@ -24,7 +24,8 @@ HERE = Path(__file__).resolve().parent
 HOST, PORT = "0.0.0.0", 8080
 HOOK_PATH = "/propose-fix"  # Путь, на который TFS отправляет события
 CHECK_PATH = "/check-work-item"  # Путь, на который TFS отправляет события переноса карточки по доске
-WORK_ITEM_TYPES = {"bug"}  # Типы карточек
+FIX_TYPES = {"bug", "user story", "task"}  # Типы карточек, которые исправляются по тегу AIFix
+CHECK_TYPES = {"bug"}  # Типы карточек, которые проверяются при переносе по доске (тег AICheck)
 TRIGGER_TAG = "AIFix"  # Тег, по которому срабатывает подписка TFS
 DEFAULT_CONFIG = HERE / "config.json"  # Конфиг с тегами репозиториев (--config)
 LOG_DIR = HERE / "logs"
@@ -85,14 +86,19 @@ def bug_url(resource: dict) -> str:
     return f"{collection}/{quote(project)}/_workitems/edit/{resource['workItemId']}"
 
 
-def bug_resource(event: dict) -> tuple[dict, str | None]:
-    """resource события изменения карточки бага и причина пропуска, если событие не обрабатывается."""
+def item_type(resource: dict) -> str:
+    """Тип карточки (System.WorkItemType) из resource события."""
+    return ((resource.get("revision") or {}).get("fields") or {}).get("System.WorkItemType", "")
+
+
+def bug_resource(event: dict, types: set[str] | None = None) -> tuple[dict, str | None]:
+    """resource события изменения карточки и причина пропуска, если событие не обрабатывается.
+    types - допустимые типы карточек в нижнем регистре; None - тип не проверяется."""
     if event.get("eventType") != "workitem.updated":
         return {}, f"событие {event.get('eventType')!r} не обрабатывается"
     resource = event.get("resource") or {}
-    item_type = ((resource.get("revision") or {}).get("fields") or {}).get("System.WorkItemType", "")
-    if item_type.lower() not in WORK_ITEM_TYPES:
-        return {}, f"тип карточки {item_type!r} не обрабатывается"
+    if types is not None and item_type(resource).lower() not in types:
+        return {}, f"тип карточки {item_type(resource)!r} не обрабатывается"
     return resource, None
 
 
@@ -113,6 +119,13 @@ def select_bug(event: dict, repo_tags: set[str]) -> tuple[int | None, str, list[
     tags, reason = triggered_tags(resource.get("fields") or {}, repo_tags)
     if reason:
         return None, reason, []
+    # Тип проверяется после тегов, чтобы предупреждать только о карточках, на которые действительно поставили AIFix.
+    kind = item_type(resource)
+    if kind.lower() not in FIX_TYPES:
+        reason = f"неподдерживаемый тип Work Item {kind!r}"
+        log.warning("Карточка %s: тег %s поставлен на %s, обрабатываются только: %s", resource.get("workItemId"),
+                    TRIGGER_TAG, reason, ", ".join(sorted(FIX_TYPES)))
+        return None, reason, []
     bug_id, detail = bug_id_url(resource)
     return bug_id, detail, tags if bug_id is not None else []
 
@@ -120,7 +133,7 @@ def select_bug(event: dict, repo_tags: set[str]) -> tuple[int | None, str, list[
 def select_column_move(event: dict) -> tuple[int | None, str, str, set[str]]:
     """Возвращает (номер карточки, ссылка, новый столбец доски, теги карточки), если карточку с тегом AICheck
     перенесли в другой столбец, иначе (None, причина пропуска, "", set())."""
-    resource, reason = bug_resource(event)
+    resource, reason = bug_resource(event, CHECK_TYPES)
     if reason:
         return None, reason, "", set()
     change = (resource.get("fields") or {}).get("System.BoardColumn")
