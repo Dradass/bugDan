@@ -6,6 +6,9 @@
     },
     "SmartInstruments": {
       "repo": "D:\\Projects\\master\\SmartInstruments"
+    },
+    "DSA" : {
+      "repo" : "D:\\Projects\\master\\SmartAgents"
     }
   }
 }

@@ -6,7 +6,8 @@
 фильтры: тег AIFix, измененное поле Tags. Тег репозитория проверяет сервер.
 
 Endpoint /check-work-item принимает то же событие для измененного поля Board Column: для карточек с тегом AICheck
-выполняет проверку бага в зависимости от нового столбца или исправление при переносе в TODO (board_checker).
+выполняет проверку бага в зависимости от нового столбца (например, наличие информации о решении бага при переносе
+в Ready for testing) или исправление при переносе в TODO (board_checker).
     python server.py [--config config.json]
 """
 import argparse, base64, hmac, json, logging, os, queue, re, threading, traceback

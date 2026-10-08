@@ -1,8 +1,10 @@
 """Загрузка карточки (work item) из TFS / Azure DevOps Server в виде текста для промпта."""
+import difflib
 import json
 import os
 import re
 from dataclasses import dataclass
+from html import escape
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
@@ -173,22 +175,28 @@ def create_pull_request(repo_url: str, source_branch: str, target_branch: str,
     return f"{collection}/{project}/_git/{repo}/pullrequest/{r.json()['pullRequestId']}"
 
 
+def _identity_id(s: requests.Session, collection: str, person: dict) -> str:
+    """id пользователя TFS по IdentityRef из карточки."""
+    if person.get("id"):
+        return person["id"]
+    # Старые версии TFS отдают в поле карточки только строку "Имя <DOMAIN\login>"
+    r = s.get(f"{collection}/_apis/identities",
+              params={"api-version": API_VERSION, "searchFilter": "General", "filterValue": person["uniqueName"]})
+    if not r.ok:
+        raise RuntimeError(f"Не удалось найти пользователя {person['uniqueName']}: "
+                           f"HTTP {r.status_code} {r.text[:500]}")
+    found = r.json().get("value") or []
+    if not found:
+        raise RuntimeError(f"Пользователь {person['uniqueName']} не найден в TFS")
+    return found[0]["id"]
+
+
 def add_required_reviewer(pr_url: str, person: dict) -> None:
     """Добавляет в pull request обязательного рецензента. person - IdentityRef из карточки (WorkItem.assigned_to)."""
     collection, project, repo = parse_git_url(pr_url)
     pr_id = pr_url.rstrip("/").rsplit("/", 1)[-1]
     s = _session()
-    reviewer_id = person.get("id")
-    if not reviewer_id:  # Старые версии TFS отдают в поле карточки только строку "Имя <DOMAIN\login>"
-        r = s.get(f"{collection}/_apis/identities",
-                  params={"api-version": API_VERSION, "searchFilter": "General", "filterValue": person["uniqueName"]})
-        if not r.ok:
-            raise RuntimeError(f"Не удалось найти пользователя {person['uniqueName']}: "
-                               f"HTTP {r.status_code} {r.text[:500]}")
-        found = r.json().get("value") or []
-        if not found:
-            raise RuntimeError(f"Пользователь {person['uniqueName']} не найден в TFS")
-        reviewer_id = found[0]["id"]
+    reviewer_id = _identity_id(s, collection, person)
     r = s.put(f"{collection}/{project}/_apis/git/repositories/{repo}/pullRequests/{pr_id}/reviewers/{reviewer_id}",
               params={"api-version": API_VERSION}, json={"vote": 0, "isRequired": True})
     if not r.ok:
@@ -259,6 +267,17 @@ def move_to_board_column(url: str, column: str, only_from: str | None = None) ->
 COMMENT_PREFIX = "[Bugdan]: "  # Начало каждого комментария, который бот пишет в карточку
 
 
+def mention_html(url: str, person: dict) -> str:
+    """HTML упоминания пользователя в комментарии карточки url: TFS отправит ему уведомление.
+    Если id пользователя определить не удалось, - просто @имя (ошибка в RuntimeError не выбрасывается)."""
+    name = escape("@" + (person.get("displayName") or person.get("uniqueName") or "?"))
+    try:
+        identity = _identity_id(_session(), parse_workitem_url(url)[0], person)
+    except (RuntimeError, requests.RequestException):
+        return name
+    return f'<a href="#" data-vss-mention="version:2.0,{escape(identity)}">{name}</a>'
+
+
 def add_workitem_comment(url: str, html: str) -> None:
     """Добавляет комментарий (HTML) в карточку по ссылке на нее. Комментарий начинается с COMMENT_PREFIX."""
     collection, _, item_id = parse_workitem_url(url)
@@ -306,14 +325,19 @@ def _get_item(s: requests.Session, collection: str, item_id: int) -> dict:
     return r.json()
 
 
-def _get_comments(s: requests.Session, collection: str, project: str, item_id: int) -> list[tuple[str, str]]:
-    """(автор, текст) комментариев карточки, от старых к новым."""
+def _comment_records(s: requests.Session, collection: str, project: str, item_id: int) -> list[tuple[dict, str]]:
+    """(автор - IdentityRef, HTML) комментариев карточки, от старых к новым."""
     r = s.get(f"{collection}/{project}/_apis/wit/workItems/{item_id}/comments",
               params={"api-version": COMMENTS_API_VERSION})
     r.raise_for_status()
     comments = sorted(r.json().get("comments", []), key=lambda c: c.get("id", 0))
-    return [((c.get("createdBy") or c.get("revisedBy") or {}).get("displayName") or "?",
-             html_to_text(c.get("text", ""))) for c in comments]
+    return [(_identity_ref(c.get("createdBy") or c.get("revisedBy")) or {}, c.get("text", "")) for c in comments]
+
+
+def _get_comments(s: requests.Session, collection: str, project: str, item_id: int) -> list[tuple[str, str]]:
+    """(автор, текст) комментариев карточки, от старых к новым."""
+    return [(author.get("displayName") or "?", html_to_text(text))
+            for author, text in _comment_records(s, collection, project, item_id)]
 
 
 def load_workitem(url: str, with_comments: bool = True) -> WorkItem:
@@ -350,6 +374,78 @@ def load_workitem(url: str, with_comments: bool = True) -> WorkItem:
                     comments=[text for _, text in comments],
                     area=fields.get("System.AreaPath", ""),
                     assigned_to=_identity_ref(fields.get("System.AssignedTo")))
+
+
+def same_person(a: dict | None, b: dict | None) -> bool:
+    """Один ли это пользователь: IdentityRef сравниваются по id, иначе по uniqueName, иначе по displayName."""
+    if not a or not b:
+        return False
+    for key in ("id", "uniqueName", "displayName"):
+        if a.get(key) and b.get(key):
+            return a[key].lower() == b[key].lower()
+    return False
+
+
+PR_ARTIFACT_PREFIX = "vstfs:///git/pullrequestid/"  # Связь с pull request в секции Development
+
+
+def linked_pull_requests(relations: list[dict]) -> list[str]:
+    """Pull request, связанные с карточкой в секции Development: vstfs:///Git/PullRequestId/<проект>%2F<репозиторий>%2F<номер>."""
+    return [rel["url"] for rel in relations
+            if rel.get("rel") == "ArtifactLink" and rel.get("url", "").lower().startswith(PR_ARTIFACT_PREFIX)]
+
+
+@dataclass
+class TextEdit:
+    author: dict  # IdentityRef того, кто изменил поле
+    field: str  # Подпись поля из TEXT_FIELDS
+    added: str  # Строки текста, которые добавило это изменение
+
+
+@dataclass
+class History:
+    comments: list[tuple[dict, str]]  # (автор - IdentityRef, HTML комментария), от старых к новым
+    text_edits: list[TextEdit]  # Дополнения текстовых полей карточки, от старых к новым
+    last_assigned_to: dict | None  # Последний, кто был указан в Assigned To (сейчас поле может быть пустым)
+
+
+def _added_text(old_html: str, new_html: str) -> str:
+    """Строки текста поля, которые появились при его изменении с old_html на new_html."""
+    old, new = html_to_text(old_html or "").splitlines(), html_to_text(new_html or "").splitlines()
+    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    added = [line for tag, _, _, j1, j2 in matcher.get_opcodes() if tag in ("replace", "insert") for line in new[j1:j2]]
+    return "\n".join(line for line in added if line.strip())
+
+
+def _get_updates(s: requests.Session, collection: str, item_id: int) -> list[dict]:
+    """Все изменения карточки (история), от старых к новым."""
+    updates, page_size = [], 200
+    while True:
+        r = s.get(f"{collection}/_apis/wit/workitems/{item_id}/updates",
+                  params={"api-version": API_VERSION, "$top": page_size, "$skip": len(updates)})
+        r.raise_for_status()
+        page = r.json().get("value", [])
+        updates += page
+        if len(page) < page_size:
+            return updates
+
+
+def load_history(item: WorkItem) -> History:
+    """Комментарии карточки с авторами, дополнения ее текстовых полей (TEXT_FIELDS) и последний ответственный
+    по истории изменений."""
+    s = _session()
+    edits, assigned = [], None
+    for update in _get_updates(s, item.collection, item.id):
+        author = _identity_ref(update.get("revisedBy")) or {}
+        fields = update.get("fields") or {}
+        for name, caption in TEXT_FIELDS.items():
+            change = fields.get(name)
+            if isinstance(change, dict) and (added := _added_text(change.get("oldValue"), change.get("newValue"))):
+                edits.append(TextEdit(author, caption, added))
+        # Когда ответственного убирают, newValue пустое, а oldValue - тот, кто был указан последним.
+        if isinstance(change := fields.get("System.AssignedTo"), dict):
+            assigned = _identity_ref(change.get("newValue")) or _identity_ref(change.get("oldValue")) or assigned
+    return History(_comment_records(s, item.collection, item.project, item.id), edits, item.assigned_to or assigned)
 
 
 @dataclass
