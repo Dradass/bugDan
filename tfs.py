@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from html import escape
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, quote, unquote
 
 import requests
 
@@ -393,6 +393,35 @@ def linked_pull_requests(relations: list[dict]) -> list[str]:
     """Pull request, связанные с карточкой в секции Development: vstfs:///Git/PullRequestId/<проект>%2F<репозиторий>%2F<номер>."""
     return [rel["url"] for rel in relations
             if rel.get("rel") == "ArtifactLink" and rel.get("url", "").lower().startswith(PR_ARTIFACT_PREFIX)]
+
+
+@dataclass
+class PullRequest:
+    url: str  # Ссылка на pull request в веб-интерфейсе
+    status: str  # Состояние в TFS: active, abandoned или completed
+
+
+def get_pull_request(link: str, collection: str) -> PullRequest:
+    """Pull request по связи из секции Development (vstfs:///Git/PullRequestId/..., collection - коллекция карточки)
+    или по ссылке вида .../<проект>/_git/<репозиторий>/pullrequest/<номер>."""
+    if link.lower().startswith(PR_ARTIFACT_PREFIX):
+        project, repo, pr_id = unquote(link[len(PR_ARTIFACT_PREFIX):]).split("/")
+    else:
+        m = re.match(r"(.+?/_git/[^/?#]+)/pullrequest/(\d+)", link, re.IGNORECASE)
+        if m is None:
+            raise ValueError(f"Не удалось разобрать ссылку на pull request: {link}")
+        (collection, project, repo), pr_id = parse_git_url(m[1]), m[2]
+    # Pull request может быть на другом сервере, а HttpNegotiateAuth запоминает хост - поэтому новая сессия.
+    r = _session().get(f"{collection}/{project}/_apis/git/repositories/{repo}/pullrequests/{pr_id}",
+                       params={"api-version": API_VERSION})
+    if not r.ok:
+        raise RuntimeError(f"Не удалось получить pull request {link}: HTTP {r.status_code} {r.text[:500]}")
+    data = r.json()
+    repository = data.get("repository") or {}
+    project_name = (repository.get("project") or {}).get("name") or unquote(project)
+    url = (f"{collection}/{quote(project_name)}/_git/{quote(repository.get('name') or unquote(repo))}"
+           f"/pullrequest/{data.get('pullRequestId', pr_id)}")
+    return PullRequest(url, str(data.get("status", "")).lower())
 
 
 @dataclass
