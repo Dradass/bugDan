@@ -11,7 +11,8 @@ import requests
 
 from bug_fixer import SLUG_MODEL, TODO_COLUMN, ask_claude
 from tfs import (COMMENT_PREFIX, History, PullRequest, WorkItem, add_workitem_comment, get_pull_request, html_to_text,
-                 linked_pull_requests, load_history, load_workitem, mention_html, move_to_board_column, same_person)
+                 linked_commits, linked_pull_requests, load_history, load_workitem, mention_html, move_to_board_column,
+                 same_person)
 
 CHECK_TAG = "AICheck"  # Тег карточки, при котором выполняются проверки
 ANALYSIS_COLUMN, READY_FOR_TESTING_COLUMN, CLOSED_COLUMN = "Analysis", "Ready for testing", "Closed"
@@ -21,8 +22,10 @@ MAX_NOTES = 20000  # Сколько последних символов комм
 
 # Ссылка на pull request: https://<сервер>/<коллекция>/<проект>/_git/<репозиторий>/pullrequest/<номер>
 PR_LINK_RE = re.compile(r"https?://[^\s\"'<>]+/_git/[^/\s\"'<>]+/pullrequest/\d+", re.IGNORECASE)
+# Ссылка на коммит: https://<сервер>/<коллекция>/<проект>/_git/<репозиторий или его id>/commit/<sha>
+COMMIT_LINK_RE = re.compile(r"https?://[^\s\"'<>]+/_git/[^/\s\"'<>]+/commit/[0-9a-f]{7,40}", re.IGNORECASE)
 
-DECISION_PROMPT = """Баг перенесен в столбец "{column}", но с ним не связан pull request с исправлением.
+DECISION_PROMPT = """Баг перенесен в столбец "{column}", но с ним не связаны pull request или коммит с исправлением.
 Ниже - комментарии ответственного за баг и текст, который он дописал в описание бага.
 Определи, объяснил ли ответственный, почему баг не будет исправлен (например: не воспроизводится, дубликат,
 поведение соответствует замыслу, уже исправлен в другой задаче, проблема в данных или настройках).
@@ -34,15 +37,18 @@ DECISION_PROMPT = """Баг перенесен в столбец "{column}", н�
 ---"""
 
 MISSING_DECISION_COMMENT = """{person}, карточка перенесена в столбец {column}, но в ней нет информации о решении бага.<br>
-Нужно одно из:<br>
-1. Связанный pull request с исправлением в разделе Development - его нет.<br>
-2. Ссылка на pull request в комментариях - ее нет.<br>
+{abandoned}Нужно одно из:<br>
+1. Связанный pull request (не отмененный) или коммит с исправлением в разделе Development - их нет.<br>
+2. Ссылка на pull request (не отмененный) или коммит в комментариях - ее нет.<br>
 3. Объяснение ответственного в комментарии или в тексте бага, почему баг не будет исправлен - {explanation}.<br>
 Добавьте недостающую информацию."""
 
 UNFINISHED_PR_COMMENT = """{person}, карточка перенесена в столбец {column}, но связанные pull request не завершены:<br>
 {prs}<br>
 {moved}"""
+
+ABANDONED_PR_BLOCK = """Все связанные pull request отменены и не считаются исправлением:<br>
+{prs}<br>"""
 
 PR_STATUSES = {"active": "в работе", "abandoned": "отменен", "completed": "завершен"}
 
@@ -66,11 +72,26 @@ def check_description(bug_id: int, url: str) -> None:
     log.info("Карточка %s: Check bug description", bug_id)
 
 
-def pr_links_in_comments(comments: list[tuple[dict, str]]) -> list[str]:
-    """Ссылки на pull request в комментариях карточки, новые первыми, без повторов
+def links_in_comments(comments: list[tuple[dict, str]], pattern: re.Pattern) -> list[str]:
+    """Ссылки по шаблону pattern в комментариях карточки, новые первыми, без повторов
     (ищутся в HTML, чтобы учесть href ссылок)."""
-    links = [link for _, text in reversed(comments) for link in reversed(PR_LINK_RE.findall(text))]
+    links = [link for _, text in reversed(comments) for link in reversed(pattern.findall(text))]
     return list(dict.fromkeys(links))
+
+
+def pr_links_in_comments(comments: list[tuple[dict, str]]) -> list[str]:
+    """Ссылки на pull request в комментариях карточки, новые первыми."""
+    return links_in_comments(comments, PR_LINK_RE)
+
+
+def commit_evidence(item: WorkItem, history: History) -> str | None:
+    """Чем подтверждено исправление коммитом (без pull request): связь в секции Development
+    или ссылка в комментарии; None, если коммита нет."""
+    if commits := linked_commits(item.relations):
+        return f"коммит в секции Development: {len(commits)}"
+    if links := links_in_comments(history.comments, COMMIT_LINK_RE):
+        return f"ссылка на коммит в комментарии: {links[0]}"
+    return None
 
 
 def assignee_notes(person: dict, history: History) -> list[str]:
@@ -110,43 +131,6 @@ def mention(url: str, person: dict | None) -> str:
     return mention_html(url, person) if person else "Ответственный не указан"
 
 
-def missing_decision_comment(url: str, person: dict | None, column: str, missing: str) -> str:
-    """HTML комментария о том, что в карточке нет информации о решении бага, с упоминанием последнего ответственного."""
-    return MISSING_DECISION_COMMENT.format(person=mention(url, person), column=html.escape(column),
-                                           explanation=html.escape(missing))
-
-
-def report_missing_decision(item: WorkItem, url: str, history: History, column: str) -> None:
-    """Проверяет объяснение ответственного, почему баг не будет исправлен (pull request у карточки нет);
-    если его нет, добавляет в карточку комментарий о том, чего не хватает."""
-    evidence, missing = assignee_explanation(item, history, column)
-    if evidence:
-        log.info("Карточка %s: решение бага подтверждено - %s", item.id, evidence)
-        return
-    add_workitem_comment(url, missing_decision_comment(url, history.last_assigned_to, column, missing))
-    log.warning("Карточка %s: нет информации о решении бага (%s), в карточку добавлен комментарий", item.id, missing)
-
-
-def _check_decision(bug_id: int, url: str) -> None:
-    """Сначала проверяются pull request, затем объяснение ответственного - оно требует запроса к Claude."""
-    item = load_workitem(url, with_comments=False)
-    history = load_history(item)
-    if prs := linked_pull_requests(item.relations):
-        log.info("Карточка %s: решение бага подтверждено - pull request в секции Development: %s", bug_id, len(prs))
-    elif links := pr_links_in_comments(history.comments):
-        log.info("Карточка %s: решение бага подтверждено - ссылка на pull request в комментарии: %s", bug_id, links[0])
-    else:
-        report_missing_decision(item, url, history, READY_FOR_TESTING_COLUMN)
-
-
-def check_decision(bug_id: int, url: str) -> None:
-    """Карточка перенесена в Ready for testing: проверка, что в ней есть информация о решении бага - связанный
-    pull request, ссылка на него в комментариях или объяснение ответственного, почему баг не будет исправлен.
-    Если ее нет, в карточку добавляется комментарий. Проверка идет в фоне."""
-    log.info("Карточка %s: проверка решения бага поставлена в очередь", bug_id)
-    _checks.submit(_run_check, _check_decision, bug_id, url)
-
-
 def pull_requests(item: WorkItem, history: History) -> list[PullRequest]:
     """Pull request карточки: связанные в секции Development и по ссылкам из комментариев, без повторов.
     Ошибка получения связанного pull request прерывает проверку, а pull request по ссылке из комментария
@@ -168,12 +152,63 @@ def unfinished_pull_requests(prs: list[PullRequest]) -> list[PullRequest]:
     return prs
 
 
+def pr_list_html(prs: list[PullRequest]) -> str:
+    """HTML списка pull request со ссылками и состояниями для комментария карточки."""
+    return "<br>".join(f'- <a href="{html.escape(pr.url)}">{html.escape(pr.url)}</a> - '
+                       f"{html.escape(PR_STATUSES.get(pr.status, pr.status or '?'))}" for pr in prs)
+
+
 def unfinished_pr_comment(url: str, person: dict | None, prs: list[PullRequest], moved: str) -> str:
     """HTML комментария о незавершенных pull request с упоминанием последнего ответственного."""
-    lines = "<br>".join(f'- <a href="{html.escape(pr.url)}">{html.escape(pr.url)}</a> - '
-                        f"{html.escape(PR_STATUSES.get(pr.status, pr.status or '?'))}" for pr in prs)
     return UNFINISHED_PR_COMMENT.format(person=mention(url, person), column=html.escape(CLOSED_COLUMN),
-                                        prs=lines, moved=html.escape(moved))
+                                        prs=pr_list_html(prs), moved=html.escape(moved))
+
+
+def missing_decision_comment(url: str, person: dict | None, column: str, missing: str,
+                             abandoned: list[PullRequest]) -> str:
+    """HTML комментария о том, что в карточке нет информации о решении бага, с упоминанием последнего ответственного.
+    abandoned - отмененные pull request карточки (у нее нет других)."""
+    return MISSING_DECISION_COMMENT.format(
+        person=mention(url, person), column=html.escape(column), explanation=html.escape(missing),
+        abandoned=ABANDONED_PR_BLOCK.format(prs=pr_list_html(abandoned)) if abandoned else "")
+
+
+def report_missing_decision(item: WorkItem, url: str, history: History, column: str,
+                            abandoned: list[PullRequest] = ()) -> None:
+    """Проверка решения бага, когда у карточки нет pull request или все они отменены (abandoned): исправление
+    коммитом, а если его нет - объяснение ответственного, почему баг не будет исправлен (требует запроса к Claude).
+    Если нет и его, добавляет в карточку комментарий о том, чего не хватает."""
+    if evidence := commit_evidence(item, history):
+        log.info("Карточка %s: решение бага подтверждено - %s", item.id, evidence)
+        return
+    evidence, missing = assignee_explanation(item, history, column)
+    if evidence:
+        log.info("Карточка %s: решение бага подтверждено - %s", item.id, evidence)
+        return
+    add_workitem_comment(url, missing_decision_comment(url, history.last_assigned_to, column, missing, list(abandoned)))
+    log.warning("Карточка %s: нет информации о решении бага (%s%s), в карточку добавлен комментарий", item.id,
+                missing, f"; отменены pull request: {', '.join(pr.url for pr in abandoned)}" if abandoned else "")
+
+
+def _check_decision(bug_id: int, url: str) -> None:
+    """Сначала проверяются pull request, затем коммиты и объяснение ответственного."""
+    item = load_workitem(url, with_comments=False)
+    history = load_history(item)
+    prs = pull_requests(item, history)
+    if alive := [pr for pr in prs if pr.status != "abandoned"]:
+        log.info("Карточка %s: решение бага подтверждено - pull request: %s", bug_id,
+                 ", ".join(f"{pr.url} ({pr.status})" for pr in alive))
+        return
+    report_missing_decision(item, url, history, READY_FOR_TESTING_COLUMN, abandoned=prs)
+
+
+def check_decision(bug_id: int, url: str) -> None:
+    """Карточка перенесена в Ready for testing: проверка, что в ней есть информация о решении бага - pull request
+    (не отмененный) или коммит, связанные в секции Development или по ссылке из комментария, либо объяснение
+    ответственного, почему баг не будет исправлен. Если ее нет, в карточку добавляется комментарий.
+    Проверка идет в фоне."""
+    log.info("Карточка %s: проверка решения бага поставлена в очередь", bug_id)
+    _checks.submit(_run_check, _check_decision, bug_id, url)
 
 
 def _check_closing(bug_id: int, url: str) -> None:
@@ -201,9 +236,10 @@ def _check_closing(bug_id: int, url: str) -> None:
 
 
 def check_closing(bug_id: int, url: str) -> None:
-    """Карточка перенесена в Closed: проверка, что ее pull request завершены, а если их нет - что ответственный
-    объяснил, почему баг не будет исправлен. Если pull request не завершены, карточка возвращается в Finalizing,
-    а в нее добавляется комментарий; если нет ни pull request, ни объяснения - только комментарий.
+    """Карточка перенесена в Closed: проверка, что ее pull request завершены, а если их нет - что баг исправлен
+    коммитом или ответственный объяснил, почему баг не будет исправлен. Если pull request не завершены, карточка
+    возвращается в Finalizing, а в нее добавляется комментарий; если нет ни pull request, ни коммита,
+    ни объяснения - только комментарий.
     Проверка идет в фоне."""
     log.info("Карточка %s: проверка закрытия бага поставлена в очередь", bug_id)
     _checks.submit(_run_check, _check_closing, bug_id, url)

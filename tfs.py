@@ -387,12 +387,23 @@ def same_person(a: dict | None, b: dict | None) -> bool:
 
 
 PR_ARTIFACT_PREFIX = "vstfs:///git/pullrequestid/"  # Связь с pull request в секции Development
+COMMIT_ARTIFACT_PREFIX = "vstfs:///git/commit/"  # Связь с коммитом в секции Development
+
+
+def _linked_artifacts(relations: list[dict], prefix: str) -> list[str]:
+    """Ссылки vstfs:///... связей карточки в секции Development, которые начинаются с prefix."""
+    return [rel["url"] for rel in relations
+            if rel.get("rel") == "ArtifactLink" and rel.get("url", "").lower().startswith(prefix)]
 
 
 def linked_pull_requests(relations: list[dict]) -> list[str]:
     """Pull request, связанные с карточкой в секции Development: vstfs:///Git/PullRequestId/<проект>%2F<репозиторий>%2F<номер>."""
-    return [rel["url"] for rel in relations
-            if rel.get("rel") == "ArtifactLink" and rel.get("url", "").lower().startswith(PR_ARTIFACT_PREFIX)]
+    return _linked_artifacts(relations, PR_ARTIFACT_PREFIX)
+
+
+def linked_commits(relations: list[dict]) -> list[str]:
+    """Коммиты, связанные с карточкой в секции Development: vstfs:///Git/Commit/<проект>%2F<репозиторий>%2F<sha>."""
+    return _linked_artifacts(relations, COMMIT_ARTIFACT_PREFIX)
 
 
 @dataclass
