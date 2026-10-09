@@ -4,6 +4,8 @@ import html
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
@@ -58,9 +60,11 @@ log = logging.getLogger("bugdan")
 _checks = ThreadPoolExecutor(max_workers=1, thread_name_prefix="board-check")
 
 
-def _run_check(check: Callable[[int, str], None], bug_id: int, url: str) -> None:
+def _run_check(check: Callable[[WorkItem, str, History], object], bug_id: int, url: str) -> None:
+    """Загружает карточку и ее историю и выполняет для них проверку check(item, url, history)."""
     try:
-        check(bug_id, url)
+        item = load_workitem(url, with_comments=False)
+        check(item, url, load_history(item))
     except SystemExit as e:  # ask_claude сообщает об ошибке через sys.exit("текст")
         log.error("Карточка %s: ошибка проверки: %s", bug_id, e.code)
     except Exception:
@@ -144,14 +148,6 @@ def pull_requests(item: WorkItem, history: History) -> list[PullRequest]:
     return list({pr.url.lower(): pr for pr in found}.values())
 
 
-def unfinished_pull_requests(prs: list[PullRequest]) -> list[PullRequest]:
-    """Незавершенные pull request: те, что еще в работе, а если таких нет и ни один не завершен - все (отмененные)."""
-    active = [pr for pr in prs if pr.status not in ("completed", "abandoned")]
-    if active or any(pr.status == "completed" for pr in prs):
-        return active
-    return prs
-
-
 def pr_list_html(prs: list[PullRequest]) -> str:
     """HTML списка pull request со ссылками и состояниями для комментария карточки."""
     return "<br>".join(f'- <a href="{html.escape(pr.url)}">{html.escape(pr.url)}</a> - '
@@ -173,33 +169,55 @@ def missing_decision_comment(url: str, person: dict | None, column: str, missing
         abandoned=ABANDONED_PR_BLOCK.format(prs=pr_list_html(abandoned)) if abandoned else "")
 
 
-def report_missing_decision(item: WorkItem, url: str, history: History, column: str,
-                            abandoned: list[PullRequest] = ()) -> None:
-    """Проверка решения бага, когда у карточки нет pull request или все они отменены (abandoned): исправление
-    коммитом, а если его нет - объяснение ответственного, почему баг не будет исправлен (требует запроса к Claude).
-    Если нет и его, добавляет в карточку комментарий о том, чего не хватает."""
-    if evidence := commit_evidence(item, history):
-        log.info("Карточка %s: решение бага подтверждено - %s", item.id, evidence)
-        return
-    evidence, missing = assignee_explanation(item, history, column)
-    if evidence:
-        log.info("Карточка %s: решение бага подтверждено - %s", item.id, evidence)
-        return
-    add_workitem_comment(url, missing_decision_comment(url, history.last_assigned_to, column, missing, list(abandoned)))
-    log.warning("Карточка %s: нет информации о решении бага (%s%s), в карточку добавлен комментарий", item.id,
-                missing, f"; отменены pull request: {', '.join(pr.url for pr in abandoned)}" if abandoned else "")
+@dataclass
+class SolveEvidence:
+    """Чем подтверждено решение бага: не отмененными pull request, коммитом или объяснением ответственного,
+    почему баг не будет исправлен. Заполняется только первое найденное по этому порядку."""
+    pull_requests: list[PullRequest] = field(default_factory=list)  # Не отмененные
+    abandoned: list[PullRequest] = field(default_factory=list)  # Отмененные
+    commit: str | None = None
+    explanation: str | None = None
+    missing: str = ""  # Чего не хватает в записях ответственного, если решение не подтверждено
+
+    @property
+    def found(self) -> bool:
+        return bool(self.pull_requests or self.commit or self.explanation)
+
+    def __str__(self) -> str:
+        if self.pull_requests:
+            return "pull request: " + ", ".join(f"{pr.url} ({pr.status})" for pr in self.pull_requests)
+        return self.commit or self.explanation or ""
 
 
-def _check_decision(bug_id: int, url: str) -> None:
-    """Сначала проверяются pull request, затем коммиты и объяснение ответственного."""
-    item = load_workitem(url, with_comments=False)
-    history = load_history(item)
+def get_solve_evidence(item: WorkItem, history: History, column: str) -> SolveEvidence:
+    """Ищет подтверждение решения бага: pull request (не отмененные), затем коммит, затем объяснение ответственного
+    (требует запроса к Claude). column - столбец, в который перенесли карточку."""
     prs = pull_requests(item, history)
-    if alive := [pr for pr in prs if pr.status != "abandoned"]:
-        log.info("Карточка %s: решение бага подтверждено - pull request: %s", bug_id,
-                 ", ".join(f"{pr.url} ({pr.status})" for pr in alive))
-        return
-    report_missing_decision(item, url, history, READY_FOR_TESTING_COLUMN, abandoned=prs)
+    evidence = SolveEvidence(pull_requests=[pr for pr in prs if pr.status != "abandoned"],
+                             abandoned=[pr for pr in prs if pr.status == "abandoned"])
+    if evidence.pull_requests:
+        return evidence
+    evidence.commit = commit_evidence(item, history)
+    if evidence.commit:
+        return evidence
+    evidence.explanation, evidence.missing = assignee_explanation(item, history, column)
+    return evidence
+
+
+def check_solve_evidence(item: WorkItem, url: str, history: History, column: str) -> SolveEvidence:
+    """Проверяет, что решение бага подтверждено (get_solve_evidence); если нет - добавляет в карточку комментарий
+    о том, чего не хватает."""
+    evidence = get_solve_evidence(item, history, column)
+    if evidence.found:
+        log.info("Карточка %s: решение бага подтверждено - %s", item.id, evidence)
+        return evidence
+    add_workitem_comment(url, missing_decision_comment(url, history.last_assigned_to, column, evidence.missing,
+                                                       evidence.abandoned))
+    log.warning("Карточка %s: нет информации о решении бага (%s%s), в карточку добавлен комментарий", item.id,
+                evidence.missing,
+                f"; отменены pull request: {', '.join(pr.url for pr in evidence.abandoned)}" if evidence.abandoned
+                else "")
+    return evidence
 
 
 def check_decision(bug_id: int, url: str) -> None:
@@ -208,35 +226,29 @@ def check_decision(bug_id: int, url: str) -> None:
     ответственного, почему баг не будет исправлен. Если ее нет, в карточку добавляется комментарий.
     Проверка идет в фоне."""
     log.info("Карточка %s: проверка решения бага поставлена в очередь", bug_id)
-    _checks.submit(_run_check, _check_decision, bug_id, url)
+    _checks.submit(_run_check, partial(check_solve_evidence, column=READY_FOR_TESTING_COLUMN), bug_id, url)
 
 
-def _check_closing(bug_id: int, url: str) -> None:
-    item = load_workitem(url, with_comments=False)
-    history = load_history(item)
-    prs = pull_requests(item, history)
-    if not prs:
-        report_missing_decision(item, url, history, CLOSED_COLUMN)
-        return
-    unfinished = unfinished_pull_requests(prs)
+def _check_closing(item: WorkItem, url: str, history: History) -> None:
+    prs = check_solve_evidence(item, url, history, CLOSED_COLUMN).pull_requests
+    unfinished = [pr for pr in prs if pr.status != "completed"]
     if not unfinished:
-        log.info("Карточка %s: все pull request завершены или отменены: %s", bug_id,
-                 ", ".join(f"{pr.url} ({pr.status})" for pr in prs))
         return
     try:
         result = move_to_board_column(url, FINALIZING_COLUMN, only_from=CLOSED_COLUMN)
         moved = f"Карточка возвращена в столбец {FINALIZING_COLUMN}."
-        log.info("Карточка %s: %s", bug_id, result)
+        log.info("Карточка %s: %s", item.id, result)
     except Exception as e:
         moved = f"Карточку не удалось вернуть в столбец {FINALIZING_COLUMN}."
-        log.error("Карточка %s: не удалось перенести в столбец %s: %s", bug_id, FINALIZING_COLUMN, e)
+        log.error("Карточка %s: не удалось перенести в столбец %s: %s", item.id, FINALIZING_COLUMN, e)
     add_workitem_comment(url, unfinished_pr_comment(url, history.last_assigned_to, unfinished, moved))
-    log.warning("Карточка %s: pull request не завершены (%s), в карточку добавлен комментарий", bug_id,
+    log.warning("Карточка %s: pull request не завершены (%s), в карточку добавлен комментарий", item.id,
                 ", ".join(f"{pr.url} ({pr.status})" for pr in unfinished))
 
 
 def check_closing(bug_id: int, url: str) -> None:
-    """Карточка перенесена в Closed: проверка, что ее pull request завершены, а если их нет - что баг исправлен
+    """Карточка перенесена в Closed: проверка, что ее pull request завершены (отмененные не учитываются),
+    а если их нет или все отменены - что баг исправлен
     коммитом или ответственный объяснил, почему баг не будет исправлен. Если pull request не завершены, карточка
     возвращается в Finalizing, а в нее добавляется комментарий; если нет ни pull request, ни коммита,
     ни объяснения - только комментарий.
