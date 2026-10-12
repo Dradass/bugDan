@@ -20,7 +20,7 @@ CHECK_TAG = "AICheck"  # Тег карточки, при котором выпо
 # Тег карточки, в которой нет информации о решении бага; по нему правило стиля доски красит карточку в коралловый
 WARNING_TAG = "AIWarning"
 ANALYSIS_COLUMN, READY_FOR_TESTING_COLUMN, CLOSED_COLUMN = "Analysis", "ReadyForTesting", "Closed"
-FINALIZING_COLUMN = "Finalizing"  # Куда возвращается закрытая карточка, если ее pull request не завершены
+FINALIZING_COLUMN = "Finalizing"  # Куда возвращается закрытая карточка, если ее решение не подтверждено
 DECISION_MODEL = SLUG_MODEL  # Модель, которая оценивает объяснение ответственного, почему баг не будет исправлен
 MAX_NOTES = 20000  # Сколько последних символов комментариев и дополнений ответственного передается Claude
 
@@ -45,11 +45,12 @@ MISSING_DECISION_COMMENT = """{person}, карточка перенесена в
 1. Связанный pull request (не отмененный) или коммит с исправлением в разделе Development - их нет.<br>
 2. Ссылка на pull request (не отмененный) или коммит в комментариях - ее нет.<br>
 3. Объяснение ответственного в комментарии или в тексте бага, почему баг не будет исправлен - {explanation}.<br>
-Добавьте недостающую информацию.{override}"""
+Добавьте недостающую информацию.{moved}{override}"""
 
-# Дописывается к MISSING_DECISION_COMMENT при переносе в Closed: карточка остается в столбце, проверку можно отключить
-CLOSED_OVERRIDE_HINT = """<br>Если вы уверены, что баг закрыт правильно, оставьте карточку в столбце {column} и снимите с нее \
-теги {tag} и {warning} - тогда при переносе по доске она больше не будет проверяться."""
+# Дописывается к MISSING_DECISION_COMMENT при переносе в Closed: карточка возвращается в Finalizing,
+# проверку можно отключить
+CLOSED_OVERRIDE_HINT = """<br>Если вы уверены, что баг закрыт правильно, снимите с карточки теги {tag} и {warning} \
+и снова перенесите ее в столбец {column} - тогда при переносе по доске она больше не будет проверяться."""
 
 UNFINISHED_PR_COMMENT = """{person}, карточка перенесена в столбец {column}, но связанные pull request не завершены:<br>
 {prs}<br>
@@ -167,12 +168,13 @@ def unfinished_pr_comment(url: str, person: dict | None, prs: list[PullRequest],
 
 
 def missing_decision_comment(url: str, person: dict | None, column: str, missing: str,
-                             abandoned: list[PullRequest]) -> str:
+                             abandoned: list[PullRequest], moved: str = "") -> str:
     """HTML комментария о том, что в карточке нет информации о решении бага, с упоминанием последнего ответственного.
-    abandoned - отмененные pull request карточки (у нее нет других)."""
+    abandoned - отмененные pull request карточки (у нее нет других), moved - итог возврата карточки из Closed."""
     return MISSING_DECISION_COMMENT.format(
         person=mention(url, person), column=html.escape(column), explanation=html.escape(missing),
         abandoned=ABANDONED_PR_BLOCK.format(prs=pr_list_html(abandoned)) if abandoned else "",
+        moved=f"<br>{html.escape(moved)}" if moved else "",
         override=CLOSED_OVERRIDE_HINT.format(column=html.escape(CLOSED_COLUMN), tag=html.escape(CHECK_TAG),
                                              warning=html.escape(WARNING_TAG))
         if column == CLOSED_COLUMN else "")
@@ -223,16 +225,29 @@ def mark_warning(item: WorkItem, url: str, present: bool) -> None:
         log.error("Карточка %s: %s", item.id, e)
 
 
+def return_to_finalizing(item: WorkItem, url: str) -> str:
+    """Возвращает карточку из Closed в Finalizing; итог для комментария карточки.
+    Ошибка переноса пишется в лог и проверку не прерывает."""
+    try:
+        log.info("Карточка %s: %s", item.id, move_to_board_column(url, FINALIZING_COLUMN, only_from=CLOSED_COLUMN))
+        return f"Карточка возвращена в столбец {FINALIZING_COLUMN}."
+    except Exception as e:
+        log.error("Карточка %s: не удалось перенести в столбец %s: %s", item.id, FINALIZING_COLUMN, e)
+        return f"Карточку не удалось вернуть в столбец {FINALIZING_COLUMN}."
+
+
 def check_solve_evidence(item: WorkItem, url: str, history: History, column: str) -> SolveEvidence:
     """Проверяет, что решение бага подтверждено (get_solve_evidence); если нет - добавляет в карточку комментарий
-    о том, чего не хватает, и тег WARNING_TAG, а если подтверждено - снимает этот тег."""
+    о том, чего не хватает, и тег WARNING_TAG (а карточку из Closed возвращает в Finalizing),
+    если подтверждено - снимает этот тег."""
     evidence = get_solve_evidence(item, history, column)
     if evidence.found:
         log.info("Карточка %s: решение бага подтверждено - %s", item.id, evidence)
         mark_warning(item, url, False)
         return evidence
+    moved = return_to_finalizing(item, url) if column == CLOSED_COLUMN else ""
     add_workitem_comment(url, missing_decision_comment(url, history.last_assigned_to, column, evidence.missing,
-                                                       evidence.abandoned))
+                                                       evidence.abandoned, moved))
     log.warning("Карточка %s: нет информации о решении бага (%s%s), в карточку добавлен комментарий", item.id,
                 evidence.missing,
                 f"; отменены pull request: {', '.join(pr.url for pr in evidence.abandoned)}" if evidence.abandoned
@@ -255,13 +270,7 @@ def _check_closing(item: WorkItem, url: str, history: History) -> None:
     unfinished = [pr for pr in prs if pr.status != "completed"]
     if not unfinished:
         return
-    try:
-        result = move_to_board_column(url, FINALIZING_COLUMN, only_from=CLOSED_COLUMN)
-        moved = f"Карточка возвращена в столбец {FINALIZING_COLUMN}."
-        log.info("Карточка %s: %s", item.id, result)
-    except Exception as e:
-        moved = f"Карточку не удалось вернуть в столбец {FINALIZING_COLUMN}."
-        log.error("Карточка %s: не удалось перенести в столбец %s: %s", item.id, FINALIZING_COLUMN, e)
+    moved = return_to_finalizing(item, url)
     add_workitem_comment(url, unfinished_pr_comment(url, history.last_assigned_to, unfinished, moved))
     log.warning("Карточка %s: pull request не завершены (%s), в карточку добавлен комментарий", item.id,
                 ", ".join(f"{pr.url} ({pr.status})" for pr in unfinished))
@@ -270,9 +279,8 @@ def _check_closing(item: WorkItem, url: str, history: History) -> None:
 def check_closing(bug_id: int, url: str) -> None:
     """Карточка перенесена в Closed: проверка, что ее pull request завершены (отмененные не учитываются),
     а если их нет или все отменены - что баг исправлен
-    коммитом или ответственный объяснил, почему баг не будет исправлен. Если pull request не завершены, карточка
-    возвращается в Finalizing, а в нее добавляется комментарий; если нет ни pull request, ни коммита,
-    ни объяснения - только комментарий.
+    коммитом или ответственный объяснил, почему баг не будет исправлен. Если pull request не завершены или нет
+    ни pull request, ни коммита, ни объяснения, карточка возвращается в Finalizing, а в нее добавляется комментарий.
     Проверка идет в фоне."""
     log.info("Карточка %s: проверка закрытия бага поставлена в очередь", bug_id)
     _checks.submit(_run_check, _check_closing, bug_id, url)

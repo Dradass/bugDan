@@ -8,7 +8,7 @@
 
 Endpoint /check-work-item принимает то же событие для измененного поля Board Column: для карточек с тегом AICheck
 выполняет проверку бага в зависимости от нового столбца (наличие информации о решении бага при переносе
-в Ready for testing, завершенность pull request при переносе в Closed) или исправление при переносе в TODO
+в Ready for testing, завершенность pull request или другое подтверждение решения при переносе в Closed) или исправление при переносе в TODO
 (board_checker).
     python server.py [--config config.json]
 """
