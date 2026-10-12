@@ -369,19 +369,17 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
                       item: WorkItem, allow_duplicate: bool = False, code_rules: str | None = None) -> None:
     bug_id, title, bug = item.id, item.title, item.text
     texts = texts_for(item.type)
-    # Проверяем по префиксу и номеру бага до запроса постфикса у Claude, чтобы не тратить на него вызов.
-    new_branch = f"{branch_prefix(bug_url, item.area, base)}/{bug_id}"
-    found = existing_bug_branches(repo_path, remote, new_branch)
+    # Проверяем по префиксу и номеру бага до запуска Claude, чтобы не тратить на него вызовы.
+    bug_branch_name = f"{branch_prefix(bug_url, item.area, base)}/{bug_id}"
+    found = existing_bug_branches(repo_path, remote, bug_branch_name)
     listing = "\n  ".join(f"{n} ({where})" for n, where in found)
     if found and not allow_duplicate:
-        sys.exit(f"Ветка для {new_branch} уже существует:\n  {listing}\n"
+        sys.exit(f"Ветка для {bug_branch_name} уже существует:\n  {listing}\n"
                  "Работа прервана, ничего не изменено. Чтобы исправить баг заново, удалите ветку "
                  "или повторите запрос с разрешением дубликата.")
     if found:
-        print(f"Ветка для {new_branch} уже существует, создаю еще одну (разрешен дубликат):\n  {listing}",
+        print(f"Ветка для {bug_branch_name} уже существует, создаю еще одну (разрешен дубликат):\n  {listing}",
               file=sys.stderr)
-    # Постфикс от Claude может совпасть с уже существующей веткой - тогда добавляем -2, -3...
-    new_branch = free_branch_name(f"{new_branch}-{branch_slug(repo_path, title, bug, texts.slug)}", {n for n, _ in found})
 
     worktree = repo_path.parent / f"{repo_path.name}-ai" / str(bug_id)
     attachments_dir = worktree.parent / f"{bug_id}-attachments"  # Вложения карточки, рядом с worktree
@@ -391,24 +389,22 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
 
     move_card(bug_url, DEVELOPMENT_COLUMN, only_from=TODO_COLUMN)  # Баг взят в работу
 
-    # Новая ветка создается от последнего коммита базовой ветки на сервере в отдельной папке (git worktree).
-    # Рабочая копия и ее текущая ветка при этом не меняются.
-    print(f"Создаю ветку {new_branch} от {remote}/{base} ({base_sha[:10]}) в {worktree}", file=sys.stderr)
+    # Claude работает в отдельной папке (git worktree) на последнем коммите базовой ветки на сервере, без ветки
+    # (detached HEAD). Ветка создается только если Claude изменил код. Рабочая копия и ее текущая ветка не меняются.
+    print(f"Создаю рабочую папку {worktree} от {remote}/{base} ({base_sha[:10]})", file=sys.stderr)
     worktree.parent.mkdir(parents=True, exist_ok=True)
-    git("worktree", "add", "-b", new_branch, str(worktree), base_sha, cwd=repo_path)
+    git("worktree", "add", "--detach", str(worktree), base_sha, cwd=repo_path)
 
-    def cleanup(delete_branch: bool):
+    def cleanup():
         shutil.rmtree(attachments_dir, ignore_errors=True)
         git("worktree", "remove", "--force", str(worktree), cwd=repo_path)
-        if delete_branch:
-            git("branch", "-D", new_branch, cwd=repo_path)
 
     try:
         attachments = download_attachments(item, attachments_dir, MAX_ATTACHMENT_SIZE)
         for a in attachments:
             print(f"Вложение {a.name}: " + (f"сохранено в {a.path}" if a.path else f"не скачано, {a.skipped}"),
                   file=sys.stderr)
-        prompt = texts.block.format(repo=repo_url, branch=new_branch, bug=bug)
+        prompt = texts.block.format(repo=repo_url, branch=base, bug=bug)
         prompt += attachments_block(attachments_dir, attachments)
         if code_rules:
             prompt += RULES_BLOCK.format(rules=code_rules)
@@ -416,7 +412,7 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
         res = ask_claude(worktree, prompt, MODEL, allow_edits=True,
                          add_dirs=[attachments_dir] if attachments_dir.exists() else [])
     except BaseException:
-        cleanup(delete_branch=True)
+        cleanup()
         raise
     summary, accuracy = split_accuracy(res["result"].strip())
     print(summary)
@@ -424,7 +420,7 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     print(f"\n---\ncost: ${res.get('total_cost_usd', 0):.2f}, session: {res.get('session_id')}", file=sys.stderr)
 
     if not git("status", "--porcelain", cwd=worktree):
-        cleanup(delete_branch=True)
+        cleanup()
         try:
             add_workitem_comment(bug_url, with_accuracy(no_fix_comment(summary, texts.no_change), accuracy))
             print(f"В карточку #{bug_id} добавлен комментарий о том, что изменения в коде не требуются.",
@@ -433,14 +429,20 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
             print(f"Внимание: {e}", file=sys.stderr)
         sys.exit("Claude не внес изменений в файлы, ветка не создана.")
 
+    # Постфикс запрашивается только когда ясно, что ветка нужна. Он может совпасть с уже существующей
+    # веткой - тогда добавляем -2, -3...
+    slug = branch_slug(repo_path, title, bug, texts.slug)
+    new_branch_name = free_branch_name(f"{bug_branch_name}-{slug}", {n for n, _ in found})
+    print(f"Создаю ветку {new_branch_name} от {remote}/{base} ({base_sha[:10]})", file=sys.stderr)
+    git("switch", "-c", new_branch_name, cwd=worktree)
     git("add", "-A", cwd=worktree)
     print("\nИзменения:\n" + git("diff", "--cached", "--stat", cwd=worktree), file=sys.stderr)
     git("commit", "-F", "-", cwd=worktree, input=f"#{bug_id} {title}\n\n{summary}\n")
 
     # Явный refspec: пушится только новая ветка, исходная не затрагивается.
-    git("push", "-u", remote, f"refs/heads/{new_branch}:refs/heads/{new_branch}", cwd=worktree)
-    print(f"Ветка {new_branch} запушена в {remote}.", file=sys.stderr)
-    cleanup(delete_branch=False)
+    git("push", "-u", remote, f"refs/heads/{new_branch_name}:refs/heads/{new_branch_name}", cwd=worktree)
+    print(f"Ветка {new_branch_name} запушена в {remote}.", file=sys.stderr)
+    cleanup()
 
     description = f"Карточка: {bug_url}\n\n{texts.pr_note}\n\n{summary}"
     try:
@@ -448,9 +450,9 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     except RuntimeError as e:
         print(f"Не удалось прочитать шаблон описания pull request: {e}", file=sys.stderr)
         template = ""
-    pr_url = create_pull_request(repo_url, new_branch, base, f"#{bug_id} {title}", description,
+    pr_url = create_pull_request(repo_url, new_branch_name, base, f"#{bug_id} {title}", description,
                                  template=template, draft=True)
-    print(f"Pull request {new_branch} -> {base}: {pr_url}", file=sys.stderr)
+    print(f"Pull request {new_branch_name} -> {base}: {pr_url}", file=sys.stderr)
 
     # Pull request уже создан, поэтому ошибки рецензента и комментария не прерывают работу, а только выводятся в лог.
     if item.assigned_to:
