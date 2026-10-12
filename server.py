@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from board_checker import CHECK_TAG, check_board_column
+from board_checker import CHECK_TAG, WARNING_TAG, check_board_column
 from bug_fixer import claude_version, find_claude, fix_bug
 
 HERE = Path(__file__).resolve().parent
@@ -227,7 +227,8 @@ def read_repos(path: Path) -> dict[str, Repo]:
     repos = {}
     for tag, item in tags.items():
         key = tag.strip().lower()
-        if not key or ";" in key or key in {TRIGGER_TAG.lower(), CHECK_TAG.lower()} or key in repos:
+        if (not key or ";" in key or key in {TRIGGER_TAG.lower(), CHECK_TAG.lower(), WARNING_TAG.lower()}
+                or key in repos):
             raise SystemExit(f"В {path} недопустимый или повторяющийся тег {tag!r}")
         if not isinstance(item, dict):
             raise SystemExit(f'В {path} для тега {tag!r} нужен словарь {{"repo": "<путь>", "rule": "<файл правила>"}}')

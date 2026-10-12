@@ -14,10 +14,12 @@ import requests
 from bug_fixer import SLUG_MODEL, TODO_COLUMN, ask_claude
 from tfs import (COMMENT_PREFIX, History, PullRequest, WorkItem, add_workitem_comment, get_pull_request, html_to_text,
                  linked_commits, linked_pull_requests, load_history, load_workitem, mention_html, move_to_board_column,
-                 same_person)
+                 same_person, set_workitem_tag)
 
 CHECK_TAG = "AICheck"  # Тег карточки, при котором выполняются проверки
-ANALYSIS_COLUMN, READY_FOR_TESTING_COLUMN, CLOSED_COLUMN = "Analysis", "Ready for testing", "Closed"
+# Тег карточки, в которой нет информации о решении бага; по нему правило стиля доски красит карточку в коралловый
+WARNING_TAG = "AIWarning"
+ANALYSIS_COLUMN, READY_FOR_TESTING_COLUMN, CLOSED_COLUMN = "Analysis", "ReadyForTesting", "Closed"
 FINALIZING_COLUMN = "Finalizing"  # Куда возвращается закрытая карточка, если ее pull request не завершены
 DECISION_MODEL = SLUG_MODEL  # Модель, которая оценивает объяснение ответственного, почему баг не будет исправлен
 MAX_NOTES = 20000  # Сколько последних символов комментариев и дополнений ответственного передается Claude
@@ -43,7 +45,11 @@ MISSING_DECISION_COMMENT = """{person}, карточка перенесена в
 1. Связанный pull request (не отмененный) или коммит с исправлением в разделе Development - их нет.<br>
 2. Ссылка на pull request (не отмененный) или коммит в комментариях - ее нет.<br>
 3. Объяснение ответственного в комментарии или в тексте бага, почему баг не будет исправлен - {explanation}.<br>
-Добавьте недостающую информацию."""
+Добавьте недостающую информацию.{override}"""
+
+# Дописывается к MISSING_DECISION_COMMENT при переносе в Closed: карточка остается в столбце, проверку можно отключить
+CLOSED_OVERRIDE_HINT = """<br>Если вы уверены, что баг закрыт правильно, оставьте карточку в столбце {column} и снимите с нее \
+теги {tag} и {warning} - тогда при переносе по доске она больше не будет проверяться."""
 
 UNFINISHED_PR_COMMENT = """{person}, карточка перенесена в столбец {column}, но связанные pull request не завершены:<br>
 {prs}<br>
@@ -166,7 +172,10 @@ def missing_decision_comment(url: str, person: dict | None, column: str, missing
     abandoned - отмененные pull request карточки (у нее нет других)."""
     return MISSING_DECISION_COMMENT.format(
         person=mention(url, person), column=html.escape(column), explanation=html.escape(missing),
-        abandoned=ABANDONED_PR_BLOCK.format(prs=pr_list_html(abandoned)) if abandoned else "")
+        abandoned=ABANDONED_PR_BLOCK.format(prs=pr_list_html(abandoned)) if abandoned else "",
+        override=CLOSED_OVERRIDE_HINT.format(column=html.escape(CLOSED_COLUMN), tag=html.escape(CHECK_TAG),
+                                             warning=html.escape(WARNING_TAG))
+        if column == CLOSED_COLUMN else "")
 
 
 @dataclass
@@ -204,12 +213,23 @@ def get_solve_evidence(item: WorkItem, history: History, column: str) -> SolveEv
     return evidence
 
 
+def mark_warning(item: WorkItem, url: str, present: bool) -> None:
+    """Ставит или снимает тег WARNING_TAG, по которому карточка выделяется цветом на доске.
+    Ошибка пишется в лог и проверку не прерывает."""
+    try:
+        if set_workitem_tag(url, WARNING_TAG, present):
+            log.info("Карточка %s: тег %s %s", item.id, WARNING_TAG, "поставлен" if present else "снят")
+    except (RuntimeError, requests.RequestException) as e:
+        log.error("Карточка %s: %s", item.id, e)
+
+
 def check_solve_evidence(item: WorkItem, url: str, history: History, column: str) -> SolveEvidence:
     """Проверяет, что решение бага подтверждено (get_solve_evidence); если нет - добавляет в карточку комментарий
-    о том, чего не хватает."""
+    о том, чего не хватает, и тег WARNING_TAG, а если подтверждено - снимает этот тег."""
     evidence = get_solve_evidence(item, history, column)
     if evidence.found:
         log.info("Карточка %s: решение бага подтверждено - %s", item.id, evidence)
+        mark_warning(item, url, False)
         return evidence
     add_workitem_comment(url, missing_decision_comment(url, history.last_assigned_to, column, evidence.missing,
                                                        evidence.abandoned))
@@ -217,6 +237,7 @@ def check_solve_evidence(item: WorkItem, url: str, history: History, column: str
                 evidence.missing,
                 f"; отменены pull request: {', '.join(pr.url for pr in evidence.abandoned)}" if evidence.abandoned
                 else "")
+    mark_warning(item, url, True)
     return evidence
 
 

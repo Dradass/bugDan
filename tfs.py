@@ -293,6 +293,26 @@ def add_workitem_comment(url: str, html: str) -> None:
                            f"HTTP {r.status_code} {r.text[:500]}")
 
 
+def set_workitem_tag(url: str, tag: str, present: bool) -> bool:
+    """Ставит (present=True) или снимает тег карточки по ссылке на нее; теги не различают регистр.
+    Возвращает False, если тег уже был в нужном состоянии и карточка не менялась."""
+    collection, _, item_id = parse_workitem_url(url)
+    s = _session()
+    tags = [t.strip() for t in (_get_item(s, collection, item_id)["fields"].get("System.Tags") or "").split(";")
+            if t.strip()]
+    has = any(t.lower() == tag.lower() for t in tags)
+    if has == present:
+        return False
+    tags = tags + [tag] if present else [t for t in tags if t.lower() != tag.lower()]
+    r = s.patch(f"{collection}/_apis/wit/workitems/{item_id}", params={"api-version": API_VERSION},
+                data=json.dumps([{"op": "add", "path": "/fields/System.Tags", "value": "; ".join(tags)}]),
+                headers={"Content-Type": "application/json-patch+json"})
+    if not r.ok:
+        raise RuntimeError(f"Не удалось {'поставить' if present else 'снять'} тег {tag} карточки #{item_id}: "
+                           f"HTTP {r.status_code} {r.text[:500]}")
+    return True
+
+
 @dataclass
 class WorkItem:
     id: int
