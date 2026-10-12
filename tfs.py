@@ -612,11 +612,11 @@ def _find_parent(s: requests.Session, item: WorkItem) -> WorkItem | None:
                             relations=relations, comments=[text for _, text in comments])
 
 
-def find_base_branch(item: WorkItem, repo_url: str, exists, default: str = "master") -> tuple[str, str]:
-    """Определяет ветку, в которой ведется работа по карточке. Возвращает (ветка, откуда она взята).
+def find_base_branch(item: WorkItem, repo_url: str, exists) -> tuple[str, str] | None:
+    """Определяет ветку, в которой ведется работа по карточке. Возвращает (ветка, откуда она взята)
+    или None, если ветка не найдена.
 
-    Порядок: сама карточка (секция Development, затем комментарии),
-    родительская User Story/Feature (так же), иначе default - ветка репозитория по умолчанию.
+    Порядок: сама карточка (секция Development, затем комментарии), родительская User Story/Feature (так же).
     exists(имя) проверяет, что ветка есть в репозитории.
     """
     # Репозиторий и карточки могут быть на разных серверах, а HttpNegotiateAuth запоминает хост
@@ -635,4 +635,4 @@ def find_base_branch(item: WorkItem, repo_url: str, exists, default: str = "mast
         for branch in _comment_branches(card.comments):
             if exists(branch):
                 return branch, f"{label}, комментарий"
-    return default, "ветка репозитория по умолчанию"
+    return None

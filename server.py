@@ -21,7 +21,7 @@ from typing import NamedTuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from board_checker import CHECK_TAG, WARNING_TAG, check_board_column
-from bug_fixer import claude_version, find_claude, fix_bug
+from bug_fixer import FIX_TAG, FixSkipped, claude_version, find_claude, fix_bug
 
 HERE = Path(__file__).resolve().parent
 HOST, PORT = "0.0.0.0", 8080
@@ -29,7 +29,7 @@ HOOK_PATH = "/propose-fix"  # Путь, на который TFS отправля
 CHECK_PATH = "/check-work-item"  # Путь, на который TFS отправляет события переноса карточки по доске
 FIX_TYPES = {"bug", "user story", "task"}  # Типы карточек, которые исправляются по тегу AIFix
 CHECK_TYPES = {"bug"}  # Типы карточек, которые проверяются при переносе по доске (тег AICheck)
-TRIGGER_TAG = "AIFix"  # Тег, по которому срабатывает подписка TFS
+TRIGGER_TAG = FIX_TAG  # Тег, по которому срабатывает подписка TFS (AIFix)
 DEFAULT_CONFIG = HERE / "config.json"  # Конфиг с тегами репозиториев (--config)
 LOG_DIR = HERE / "logs"
 FIX_LOG_DIR = LOG_DIR / "fix_logs"  # Логи исправлений, по файлу на запуск
@@ -213,16 +213,13 @@ class TimestampWriter:
 class Repo(NamedTuple):
     path: Path  # Путь до репозитория решения
     rule: Path | None  # Файл с правилом написания кода для Claude; None - без правила
-    default_branch: str  # Базовая ветка, если в карточке и ее родителе ветка не найдена
-
-
-DEFAULT_BRANCH = "master"  # Ветка по умолчанию, если в конфиге для тега она не задана
+    default_branch: str | None  # Базовая ветка, если в карточке и ее родителе ветка не найдена; None - не задана
 
 
 def read_repos(path: Path) -> dict[str, Repo]:
     """Репозитории по тегам (в нижнем регистре) из секции "tags" конфига:
     {"<тег>": {"repo": "<путь>", "rule": "<файл правила, необязательно>", "default_branch": "<ветка, необязательно>"}}.
-    Относительный путь до файла правила считается от папки конфига. Если ветка не задана - master."""
+    Относительный путь до файла правила считается от папки конфига. Если ветка не задана - None."""
     try:
         tags = json.loads(path.read_text(encoding="utf-8-sig"))["tags"]
     except (OSError, ValueError, KeyError, TypeError) as e:
@@ -246,10 +243,12 @@ def read_repos(path: Path) -> dict[str, Repo]:
                 raise SystemExit(f'В {path} для тега {tag!r} в "rule" должен быть путь до файла')
             rule = (path.parent / rule).resolve()
             read_rule(rule)  # Ошибка в пути видна сразу при запуске, а не при первом баге
-        branch = item.get("default_branch") or DEFAULT_BRANCH
-        if not isinstance(branch, str) or not branch.strip():
-            raise SystemExit(f'В {path} для тега {tag!r} в "default_branch" должно быть имя ветки')
-        repos[key] = Repo(Path(repo), rule, branch.strip().removeprefix("refs/heads/"))
+        branch = item.get("default_branch") or None
+        if branch is not None:
+            if not isinstance(branch, str) or not branch.strip():
+                raise SystemExit(f'В {path} для тега {tag!r} в "default_branch" должно быть имя ветки')
+            branch = branch.strip().removeprefix("refs/heads/")
+        repos[key] = Repo(Path(repo), rule, branch)
     return repos
 
 
@@ -258,33 +257,35 @@ class Runner:
 
     def __init__(self, repos: dict[str, Repo], log_dir: Path):
         self.repos, self.log_dir = repos, log_dir
-        self.jobs: queue.Queue[tuple[int, str, str, bool]] = queue.Queue()
+        self.jobs: queue.Queue[tuple[int, str, str, bool, bool]] = queue.Queue()
         self.pending: set[tuple[int, str]] = set()
         self.lock = threading.Lock()
         threading.Thread(target=self._work, daemon=True).start()
 
-    def submit(self, bug_id: int, url: str, tag: str, allow_duplicate: bool = False) -> bool:
+    def submit(self, bug_id: int, url: str, tag: str, allow_duplicate: bool = False,
+               require_branch: bool = False) -> bool:
         """Ставит карточку в очередь на исправление в репозитории тега; False, если она уже ждет
-        или обрабатывается в этом репозитории (повтор события)."""
+        или обрабатывается в этом репозитории (повтор события). require_branch - не исправлять,
+        если в карточке не указана ветка (иначе берется ветка репозитория по умолчанию)."""
         with self.lock:
             if (bug_id, tag) in self.pending:
                 return False
             self.pending.add((bug_id, tag))
-        self.jobs.put((bug_id, url, tag, allow_duplicate))
+        self.jobs.put((bug_id, url, tag, allow_duplicate, require_branch))
         return True
 
     def _work(self):
         while True:
-            bug_id, url, tag, allow_duplicate = self.jobs.get()
+            bug_id, url, tag, allow_duplicate, require_branch = self.jobs.get()
             try:
-                self._run(bug_id, url, tag, allow_duplicate)
+                self._run(bug_id, url, tag, allow_duplicate, require_branch)
             except Exception:
                 log.exception("Карточка %s (%s): ошибка запуска", bug_id, tag)
             finally:
                 with self.lock:
                     self.pending.discard((bug_id, tag))
 
-    def _run(self, bug_id: int, url: str, tag: str, allow_duplicate: bool):
+    def _run(self, bug_id: int, url: str, tag: str, allow_duplicate: bool, require_branch: bool):
         repo = self.repos[tag]
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log_file = self.log_dir / f"{bug_id}-{tag}-{datetime.now():%Y%m%d-%H%M%S}.log"
@@ -292,19 +293,25 @@ class Runner:
         # Вывод bug_fixer (print) пишется в лог запуска. Запуски идут по одному, поэтому подмена stdout не мешает другим.
         with log_file.open("w", encoding="utf-8") as f, redirect_stdout(out := TimestampWriter(f)), redirect_stderr(out):
             print(f"bug-url: {url}\ntag: {tag}\nrepo-path: {repo.path}\nallow-duplicate: {allow_duplicate}\n"
-                  f"claude-rule: {repo.rule or '-'}\ndefault-branch: {repo.default_branch}\n")
+                  f"claude-rule: {repo.rule or '-'}\ndefault-branch: {repo.default_branch or '-'}\n"
+                  f"require-branch: {require_branch}\n")
             try:
                 # Файл правила читается при каждом запуске, чтобы его правки применялись без перезапуска сервера.
                 rules = read_rule(repo.rule) if repo.rule else None
-                fix_bug(url, str(repo.path), allow_duplicate, rules, repo.default_branch)
-                error = None
+                fix_bug(url, str(repo.path), allow_duplicate, rules, repo.default_branch, require_branch)
+                error = skipped = None
+            except FixSkipped as e:
+                error, skipped = None, str(e)
+                print(f"Исправление пропущено: {skipped}")
             except SystemExit as e:  # bug_fixer сообщает об ошибке через sys.exit("текст")
-                error = e.code
+                error, skipped = e.code, None
                 print(error)
             except Exception:
-                error = traceback.format_exc()
+                error, skipped = traceback.format_exc(), None
                 print(error)
-        if error:
+        if skipped:
+            log.warning("Карточка %s (%s): исправление пропущено, %s", bug_id, tag, skipped)
+        elif error:
             log.error("Карточка %s (%s): ошибка, подробности в %s", bug_id, tag, log_file)
         else:
             log.info("Карточка %s (%s): готово", bug_id, tag)
@@ -380,18 +387,20 @@ class HookHandler(BaseHTTPRequestHandler):
             if not tags:
                 log.warning("Карточка %s перенесена в %s, но на ней нет ни одного из тегов репозиториев: %s",
                             bug_id, column, ", ".join(sorted(repo_tags)))
-            self.queue_fix(bug_id, url, tags, allow_duplicate)
+            # Без ветки в карточке исправление по AICheck не запускается, ветка по умолчанию не берется.
+            self.queue_fix(bug_id, url, tags, allow_duplicate, require_branch=True)
 
         if not check_board_column(bug_id, detail, column, fix):
             log.debug("Карточка %s перенесена в столбец %s, для него действий нет", bug_id, column)
             return self.reply(200, {"status": "ignored", "reason": f"столбец {column!r} не обрабатывается"})
         self.reply(200, {"status": "processed", "bug": bug_id, "column": column})
 
-    def queue_fix(self, bug_id: int, url: str, tags: list[str], allow_duplicate: bool) -> list[str]:
+    def queue_fix(self, bug_id: int, url: str, tags: list[str], allow_duplicate: bool,
+                  require_branch: bool = False) -> list[str]:
         """Ставит карточку в очередь на исправление в репозиториях тегов; возвращает теги, по которым поставлена."""
         queued = []
         for tag in tags:
-            if not self.server.runner.submit(bug_id, url, tag, allow_duplicate):
+            if not self.server.runner.submit(bug_id, url, tag, allow_duplicate, require_branch):
                 log.info("Карточка %s (%s) уже в очереди, повтор события пропущен", bug_id, tag)
                 continue
             queued.append(tag)
@@ -460,7 +469,7 @@ def main():
     server = HookServer((HOST, PORT), cfg, Runner(repos, FIX_LOG_DIR))
     log.info("Жду события на http://%s:%s%s и %s, теги %s, %s и теги репозиториев: %s", HOST, PORT, HOOK_PATH,
              CHECK_PATH, TRIGGER_TAG, CHECK_TAG,
-             "; ".join(f"{t} -> {r.path} (правило Claude {r.rule or 'не задано'}, ветка по умолчанию {r.default_branch})"
+             "; ".join(f"{t} -> {r.path} (правило Claude {r.rule or 'не задано'}, ветка по умолчанию {r.default_branch or 'не задана'})"
                        for t, r in repos.items()))
     try:
         server.serve_forever()

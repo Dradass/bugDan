@@ -1,4 +1,5 @@
 import html, json, os, re, shutil, subprocess, sys
+from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple
 
@@ -469,12 +470,33 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
         print(f"Внимание: {e}", file=sys.stderr)
 
 
+class FixSkipped(Exception):
+    """Исправление не запускалось (например, в карточке не указана ветка), ничего не изменено."""
+
+
+DEFAULT_BRANCH_NOTE = """
+Ветка, в которой ведется работа, не указана ни в карточке, ни в ее родительской User Story/Feature,
+поэтому ветка взята из значения "По умолчанию" для репозитория: {branch}."""
+
+NO_BRANCH_COMMENT = """<b>Работа не начата: не указана ветка, в которой проявляется баг.</b><br>
+Ветка не найдена ни в карточке, ни в ее родительской User Story/Feature, а ветка по умолчанию для репозитория
+{repo} не задана. Укажите ветку одним из способов:<br>
+1. Свяжите ветку с карточкой в секции Development (Add link -&gt; Branch).<br>
+2. Напишите в комментарии карточки имя ветки после слова «ветка» или «branch», например: «ветка: vega/43383».<br>
+3. Сделайте то же в родительской User Story или Feature.<br>
+Ветка должна быть в репозитории на сервере. После добавления ветки снимите с карточки тег {tag} и поставьте его заново."""
+FIX_TAG = "AIFix"  # Тег запуска исправления (подписка TFS), упоминается в комментарии NO_BRANCH_COMMENT
+
+
 def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False, code_rules: str | None = None,
-            default_branch: str = "master") -> None:
+            default_branch: str | None = None, require_branch: bool = False) -> None:
     """Исправляет баг или выполняет задачу (User Story, Task) в новой ветке: коммит, push и черновик pull request.
     allow_duplicate - создать новую ветку, даже если ветка этого бага уже есть.
     code_rules - правила написания кода, которые Claude учитывает при исправлении.
-    default_branch - базовая ветка, если в карточке и ее родителе ветка не найдена.
+    default_branch - базовая ветка, если в карточке и ее родителе ветка не найдена (в текст бага для Claude
+    дописывается, что ветка взята по умолчанию). Если она не задана, в карточку добавляется комментарий о том,
+    как указать ветку, и выбрасывается FixSkipped.
+    require_branch - если ветка в карточке и ее родителе не найдена, не исправлять, а выбросить FixSkipped.
     Ошибки завершаются через sys.exit("текст")."""
     repo_path = Path(repo_path)
     repo_url, current, remote = check_repo(repo_path)
@@ -482,7 +504,22 @@ def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False, code_ru
 
     item = load_workitem(bug_url)
     heads = remote_branches(repo_path, remote)
-    base, source = find_base_branch(item, repo_url, heads.__contains__, default_branch)
+    found = find_base_branch(item, repo_url, heads.__contains__)
+    if found:
+        base, source = found
+    elif require_branch:
+        raise FixSkipped("в карточке и ее родительской User Story/Feature не указана ветка")
+    elif default_branch is None:
+        try:
+            add_workitem_comment(bug_url, NO_BRANCH_COMMENT.format(repo=html.escape(repo_url), tag=FIX_TAG))
+            commented = "в карточку добавлен комментарий о том, как указать ветку"
+        except Exception as e:
+            commented = f"комментарий в карточку добавить не удалось: {e}"
+        raise FixSkipped("ветка не указана ни в карточке и ее родительской User Story/Feature, "
+                         f"ни в default_branch репозитория; {commented}")
+    else:
+        base, source = default_branch, "ветка репозитория по умолчанию"
+        item = replace(item, text=item.text + DEFAULT_BRANCH_NOTE.format(branch=base))
     print(f"Базовая ветка: {base} ({source})", file=sys.stderr)
 
     base_sha = fetch_branch(repo_path, remote, base)

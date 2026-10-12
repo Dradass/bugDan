@@ -2,15 +2,14 @@
   "tags": {
     "Applied": {
       "repo": "D:\\Projects\\master\\RX",
-	  "rule": "D:\\Projects\\master\\RX\\src\\.cursor\\rules\\applied-rules.mdc"
+	  "rule": "D:\\Projects\\master\\RX\\src\\.cursor\\rules\\applied-rules.mdc",
+      "default_branch": "master"
     },
     "SmartInstruments": {
-      "repo": "D:\\Projects\\master\\SmartInstruments",
-      "default_branch": "dev"
+      "repo": "D:\\Projects\\master\\SmartInstruments"
     },
     "DSA" : {
-      "repo" : "D:\\Projects\\master\\SmartAgents",
-      "default_branch": "develop"
+      "repo" : "D:\\Projects\\master\\SmartAgents"
     }
   }
 }
