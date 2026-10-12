@@ -612,11 +612,12 @@ def _find_parent(s: requests.Session, item: WorkItem) -> WorkItem | None:
                             relations=relations, comments=[text for _, text in comments])
 
 
-def find_base_branch(item: WorkItem, repo_url: str, exists) -> tuple[str, str]:
+def find_base_branch(item: WorkItem, repo_url: str, exists, default: str = "master") -> tuple[str, str]:
     """Определяет ветку, в которой ведется работа по карточке. Возвращает (ветка, откуда она взята).
 
-    Порядок: родительская User Story/Feature (секция Development, затем комментарии),
-    сама карточка (так же), иначе master. exists(имя) проверяет, что ветка есть в репозитории.
+    Порядок: сама карточка (секция Development, затем комментарии),
+    родительская User Story/Feature (так же), иначе default - ветка репозитория по умолчанию.
+    exists(имя) проверяет, что ветка есть в репозитории.
     """
     # Репозиторий и карточки могут быть на разных серверах, а HttpNegotiateAuth запоминает хост
     # первого запроса - поэтому для каждого сервера своя сессия.
@@ -626,7 +627,7 @@ def find_base_branch(item: WorkItem, repo_url: str, exists) -> tuple[str, str]:
     repo_id = r.json()["id"]
 
     parent = _find_parent(_session(), item)
-    for card in ([parent] if parent else []) + [item]:
+    for card in [item] + ([parent] if parent else []):
         label = f"{card.type} #{card.id}"
         for branch in _linked_branches(card.relations, repo_id):
             if exists(branch):
@@ -634,4 +635,4 @@ def find_base_branch(item: WorkItem, repo_url: str, exists) -> tuple[str, str]:
         for branch in _comment_branches(card.comments):
             if exists(branch):
                 return branch, f"{label}, комментарий"
-    return "master", "по умолчанию"
+    return default, "ветка репозитория по умолчанию"

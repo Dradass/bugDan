@@ -1,6 +1,7 @@
 """HTTP-сервер для service hook TFS: исправляет баг, User Story или Task (bug_fixer.fix_bug), когда на карточке
-оказываются тег AIFix и тег репозитория. Теги репозиториев, пути до них и необязательные файлы правил Claude задаются
-в config.json: {"tags": {"<тег>": {"repo": "<путь>", "rule": "<файл правила>"}}}.
+оказываются тег AIFix и тег репозитория. Теги репозиториев, пути до них, необязательные файлы правил Claude
+и ветки по умолчанию задаются в config.json:
+{"tags": {"<тег>": {"repo": "<путь>", "rule": "<файл правила>", "default_branch": "<ветка>"}}}.
 
 Подписка в TFS: Project Settings -> Service hooks -> Web Hooks, событие "Work item updated",
 фильтры: тег AIFix, измененное поле Tags. Тег репозитория проверяет сервер.
@@ -212,12 +213,16 @@ class TimestampWriter:
 class Repo(NamedTuple):
     path: Path  # Путь до репозитория решения
     rule: Path | None  # Файл с правилом написания кода для Claude; None - без правила
+    default_branch: str  # Базовая ветка, если в карточке и ее родителе ветка не найдена
+
+
+DEFAULT_BRANCH = "master"  # Ветка по умолчанию, если в конфиге для тега она не задана
 
 
 def read_repos(path: Path) -> dict[str, Repo]:
     """Репозитории по тегам (в нижнем регистре) из секции "tags" конфига:
-    {"<тег>": {"repo": "<путь>", "rule": "<файл правила, необязательно>"}}.
-    Относительный путь до файла правила считается от папки конфига."""
+    {"<тег>": {"repo": "<путь>", "rule": "<файл правила, необязательно>", "default_branch": "<ветка, необязательно>"}}.
+    Относительный путь до файла правила считается от папки конфига. Если ветка не задана - master."""
     try:
         tags = json.loads(path.read_text(encoding="utf-8-sig"))["tags"]
     except (OSError, ValueError, KeyError, TypeError) as e:
@@ -241,7 +246,10 @@ def read_repos(path: Path) -> dict[str, Repo]:
                 raise SystemExit(f'В {path} для тега {tag!r} в "rule" должен быть путь до файла')
             rule = (path.parent / rule).resolve()
             read_rule(rule)  # Ошибка в пути видна сразу при запуске, а не при первом баге
-        repos[key] = Repo(Path(repo), rule)
+        branch = item.get("default_branch") or DEFAULT_BRANCH
+        if not isinstance(branch, str) or not branch.strip():
+            raise SystemExit(f'В {path} для тега {tag!r} в "default_branch" должно быть имя ветки')
+        repos[key] = Repo(Path(repo), rule, branch.strip().removeprefix("refs/heads/"))
     return repos
 
 
@@ -284,11 +292,11 @@ class Runner:
         # Вывод bug_fixer (print) пишется в лог запуска. Запуски идут по одному, поэтому подмена stdout не мешает другим.
         with log_file.open("w", encoding="utf-8") as f, redirect_stdout(out := TimestampWriter(f)), redirect_stderr(out):
             print(f"bug-url: {url}\ntag: {tag}\nrepo-path: {repo.path}\nallow-duplicate: {allow_duplicate}\n"
-                  f"claude-rule: {repo.rule or '-'}\n")
+                  f"claude-rule: {repo.rule or '-'}\ndefault-branch: {repo.default_branch}\n")
             try:
                 # Файл правила читается при каждом запуске, чтобы его правки применялись без перезапуска сервера.
                 rules = read_rule(repo.rule) if repo.rule else None
-                fix_bug(url, str(repo.path), allow_duplicate, rules)
+                fix_bug(url, str(repo.path), allow_duplicate, rules, repo.default_branch)
                 error = None
             except SystemExit as e:  # bug_fixer сообщает об ошибке через sys.exit("текст")
                 error = e.code
@@ -452,7 +460,8 @@ def main():
     server = HookServer((HOST, PORT), cfg, Runner(repos, FIX_LOG_DIR))
     log.info("Жду события на http://%s:%s%s и %s, теги %s, %s и теги репозиториев: %s", HOST, PORT, HOOK_PATH,
              CHECK_PATH, TRIGGER_TAG, CHECK_TAG,
-             "; ".join(f"{t} -> {r.path} (правило Claude {r.rule or 'не задано'})" for t, r in repos.items()))
+             "; ".join(f"{t} -> {r.path} (правило Claude {r.rule or 'не задано'}, ветка по умолчанию {r.default_branch})"
+                       for t, r in repos.items()))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

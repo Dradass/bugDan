@@ -469,10 +469,12 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
         print(f"Внимание: {e}", file=sys.stderr)
 
 
-def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False, code_rules: str | None = None) -> None:
+def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False, code_rules: str | None = None,
+            default_branch: str = "master") -> None:
     """Исправляет баг или выполняет задачу (User Story, Task) в новой ветке: коммит, push и черновик pull request.
     allow_duplicate - создать новую ветку, даже если ветка этого бага уже есть.
     code_rules - правила написания кода, которые Claude учитывает при исправлении.
+    default_branch - базовая ветка, если в карточке и ее родителе ветка не найдена.
     Ошибки завершаются через sys.exit("текст")."""
     repo_path = Path(repo_path)
     repo_url, current, remote = check_repo(repo_path)
@@ -480,7 +482,7 @@ def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False, code_ru
 
     item = load_workitem(bug_url)
     heads = remote_branches(repo_path, remote)
-    base, source = find_base_branch(item, repo_url, heads.__contains__)
+    base, source = find_base_branch(item, repo_url, heads.__contains__, default_branch)
     print(f"Базовая ветка: {base} ({source})", file=sys.stderr)
 
     base_sha = fetch_branch(repo_path, remote, base)

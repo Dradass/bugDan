@@ -5,10 +5,12 @@
 	  "rule": "D:\\Projects\\master\\RX\\src\\.cursor\\rules\\applied-rules.mdc"
     },
     "SmartInstruments": {
-      "repo": "D:\\Projects\\master\\SmartInstruments"
+      "repo": "D:\\Projects\\master\\SmartInstruments",
+      "default_branch": "dev"
     },
     "DSA" : {
-      "repo" : "D:\\Projects\\master\\SmartAgents"
+      "repo" : "D:\\Projects\\master\\SmartAgents",
+      "default_branch": "develop"
     }
   }
 }
