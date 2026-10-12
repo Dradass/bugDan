@@ -13,6 +13,9 @@ TODO_COLUMN, DEVELOPMENT_COLUMN = "TODO", "Development"
 
 MAX_ATTACHMENT_SIZE = 2 * 1024 * 1024  # Вложения карточки больше этого размера не скачиваются
 
+CLAUDE_TIMEOUT = 60 * 60  # Сколько секунд ждать завершения claude, после этого процесс останавливается
+CLAUDE_HIDDEN_ENV = {"TFS_PAT", "BUGDAN_HOOK_USER", "BUGDAN_HOOK_PASSWORD"}  # Не передаются в окружение claude
+
 BUG_BLOCK = """Ты работаешь в репозитории {repo} (ветка {branch}).
 Описание бага:
 ---
@@ -121,12 +124,62 @@ def decode_console(data: bytes) -> str:
         return data.decode("oem" if sys.platform == "win32" else "latin-1", errors="replace")
 
 
+_claude_bin: str | None = None
+
+
+def find_claude() -> str:
+    """Абсолютный путь до Claude Code CLI: из CLAUDE_BIN или из PATH. Ищется один раз, ошибки - через sys.exit."""
+    global _claude_bin
+    if _claude_bin:
+        return _claude_bin
+    if env_bin := os.environ.get("CLAUDE_BIN"):
+        path = Path(env_bin)
+        if not path.is_absolute() or not path.is_file():
+            sys.exit(f"CLAUDE_BIN должен быть абсолютным путем до существующего файла: {env_bin}")
+    else:
+        found = shutil.which("claude") or sys.exit("claude CLI не найден в PATH, задайте путь в CLAUDE_BIN")
+        path = Path(found).resolve()
+        # На Windows shutil.which сначала ищет в текущей папке, даже если ее нет в PATH.
+        if path.parent not in {Path(d).resolve() for d in os.environ.get("PATH", "").split(os.pathsep) if d}:
+            sys.exit(f"claude найден вне PATH ({path}), задайте путь в CLAUDE_BIN")
+    _claude_bin = str(path)
+    return _claude_bin
+
+
+def run_claude(args: list[str], timeout: int, input: bytes = b"", cwd: Path | None = None) -> subprocess.CompletedProcess:
+    """Запускает claude без секретов сервера в окружении. Если он не завершился за timeout секунд,
+    завершает его вместе с дочерними процессами. Ошибки - через sys.exit."""
+    claude = find_claude()
+    env = {k: v for k, v in os.environ.items() if k.upper() not in CLAUDE_HIDDEN_ENV}
+    try:
+        proc = subprocess.Popen([claude, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, cwd=cwd, env=env)
+    except OSError as e:
+        sys.exit(f"Не удалось запустить {claude}: {e}")
+    try:
+        stdout, stderr = proc.communicate(input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if sys.platform == "win32":  # Обертка claude.cmd запускает node дочерним процессом, kill() его не завершит
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        proc.kill()
+        proc.wait()
+        sys.exit(f"claude не завершился за {timeout} с, процесс остановлен")
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+
+
+def claude_version() -> str:
+    """Версия Claude Code CLI (claude --version). Ошибки - через sys.exit."""
+    proc = run_claude(["--version"], timeout=60)
+    if proc.returncode != 0:
+        sys.exit(f"claude --version завершился с кодом {proc.returncode}: {decode_console(proc.stderr)}")
+    return proc.stdout.decode("utf-8", errors="replace").strip()
+
+
 def ask_claude(repo_path: Path, prompt: str, model: str, allow_edits: bool = False, tools: str | None = None,
                max_turns: int | None = None, add_dirs: list[Path] = ()) -> dict:
-    claude = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or sys.exit("claude CLI не найден в PATH")
     if tools is None:
         tools = "Read,Grep,Glob,Edit,Write" if allow_edits else "Read,Grep,Glob"
-    args = [claude, "-p",
+    args = ["-p",
             "--output-format", "json",
             "--model", model,
             "--max-turns", str(max_turns or (60 if allow_edits else 40))]
@@ -136,7 +189,7 @@ def ask_claude(repo_path: Path, prompt: str, model: str, allow_edits: bool = Fal
         args += ["--permission-mode", "acceptEdits"]
     for directory in add_dirs:  # Папки вне репозитория, к которым Claude получает доступ (вложения карточки)
         args += ["--add-dir", str(directory)]
-    proc = subprocess.run(args, input=prompt.encode("utf-8"), cwd=repo_path, capture_output=True)
+    proc = run_claude(args, CLAUDE_TIMEOUT, prompt.encode("utf-8"), repo_path)
     stdout = proc.stdout.decode("utf-8", errors="replace")
     try:
         res = json.loads(stdout)

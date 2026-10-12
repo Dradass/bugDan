@@ -20,7 +20,7 @@ from typing import NamedTuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from board_checker import CHECK_TAG, check_board_column
-from bug_fixer import fix_bug
+from bug_fixer import claude_version, find_claude, fix_bug
 
 HERE = Path(__file__).resolve().parent
 HOST, PORT = "0.0.0.0", 8080
@@ -46,7 +46,7 @@ def parse_tags(value) -> set[str]:
     return {t.strip().lower() for t in (value or "").split(";") if t.strip()}
 
 
-def tags_change(fields: dict) -> tuple[set[str], set[str]] | None:
+def get_changed_tags(fields: dict) -> tuple[set[str], set[str]] | None:
     """Теги до и после этого изменения карточки (resource.fields события workitem.updated);
     None, если теги не менялись."""
     change = fields.get("System.Tags")
@@ -56,23 +56,23 @@ def tags_change(fields: dict) -> tuple[set[str], set[str]] | None:
     return parse_tags(change.get("oldValue")), parse_tags(change.get("newValue"))
 
 
-def triggered_tags(fields: dict, repo_tags: set[str]) -> tuple[list[str], str | None]:
+def get_triggered_tags(fields: dict, repo_tags: set[str]) -> tuple[list[str], str | None]:
     """Теги репозиториев, по которым нужно запустить исправление, и причина пропуска, если таких нет.
     Запуск по тегу репозитория - когда в этом изменении на карточке впервые оказались он и AIFix
     (неважно, какой из них поставлен последним)."""
-    change = tags_change(fields)
-    if change is None:
+    changed_tags = get_changed_tags(fields)
+    if changed_tags is None:
         return [], "теги не менялись"
-    old, new = change
-    trigger = TRIGGER_TAG.lower()
-    if trigger not in new:
-        return [], f"нет тега {trigger}"
-    present = sorted(repo_tags & new)
-    if not present:
+    old_tag, new_tag = changed_tags
+    trigger_tag = TRIGGER_TAG.lower()
+    if trigger_tag not in new_tag:
+        return [], f"нет тега {trigger_tag}"
+    matched_tags = sorted(repo_tags & new_tag)
+    if not matched_tags:
         return [], "нет ни одного из тегов " + ", ".join(sorted(repo_tags))
-    tags = [t for t in present if not {trigger, t} <= old]
+    tags = [t for t in matched_tags if not {trigger_tag, t} <= old_tag]
     if not tags:
-        return [], f"теги {trigger}, " + ", ".join(present) + " стояли и до изменения"
+        return [], f"теги {trigger_tag}, " + ", ".join(matched_tags) + " стояли и до изменения"
     return tags, None
 
 
@@ -93,18 +93,18 @@ def item_type(resource: dict) -> str:
     return ((resource.get("revision") or {}).get("fields") or {}).get("System.WorkItemType", "")
 
 
-def bug_resource(event: dict, types: set[str] | None = None) -> tuple[dict, str | None]:
+def get_bug_resource(event_properties: dict, types: set[str] | None = None) -> tuple[dict, str | None]:
     """resource события изменения карточки и причина пропуска, если событие не обрабатывается.
     types - допустимые типы карточек в нижнем регистре; None - тип не проверяется."""
-    if event.get("eventType") != "workitem.updated":
-        return {}, f"событие {event.get('eventType')!r} не обрабатывается"
-    resource = event.get("resource") or {}
+    if event_properties.get("eventType") != "workitem.updated":
+        return {}, f"событие {event_properties.get('eventType')!r} не обрабатывается"
+    resource = event_properties.get("resource") or {}
     if types is not None and item_type(resource).lower() not in types:
         return {}, f"тип карточки {item_type(resource)!r} не обрабатывается"
     return resource, None
 
 
-def bug_id_url(resource: dict) -> tuple[int | None, str]:
+def get_bug_id_by_url(resource: dict) -> tuple[int | None, str]:
     """(номер карточки, ссылка) или (None, причина пропуска), если в событии нет данных карточки."""
     try:
         return int(resource["workItemId"]), bug_url(resource)
@@ -112,13 +112,13 @@ def bug_id_url(resource: dict) -> tuple[int | None, str]:
         return None, f"в событии нет данных карточки: {e!r}"
 
 
-def select_bug(event: dict, repo_tags: set[str]) -> tuple[int | None, str, list[str]]:
+def select_bug(event_properties: dict, repo_tags: set[str]) -> tuple[int | None, str, list[str]]:
     """Возвращает (номер карточки, ссылка, теги репозиториев), если событие должно запустить исправление,
     иначе (None, причина пропуска, [])."""
-    resource, reason = bug_resource(event)
+    resource, reason = get_bug_resource(event_properties)
     if reason:
         return None, reason, []
-    tags, reason = triggered_tags(resource.get("fields") or {}, repo_tags)
+    tags, reason = get_triggered_tags(resource.get("fields") or {}, repo_tags)
     if reason:
         return None, reason, []
     # Тип проверяется после тегов, чтобы предупреждать только о карточках, на которые действительно поставили AIFix.
@@ -128,14 +128,14 @@ def select_bug(event: dict, repo_tags: set[str]) -> tuple[int | None, str, list[
         log.warning("Карточка %s: тег %s поставлен на %s, обрабатываются только: %s", resource.get("workItemId"),
                     TRIGGER_TAG, reason, ", ".join(sorted(FIX_TYPES)))
         return None, reason, []
-    bug_id, detail = bug_id_url(resource)
-    return bug_id, detail, tags if bug_id is not None else []
+    bug_id, error_text = get_bug_id_by_url(resource)
+    return bug_id, error_text, tags if bug_id is not None else []
 
 
 def select_column_move(event: dict) -> tuple[int | None, str, str, set[str]]:
     """Возвращает (номер карточки, ссылка, новый столбец доски, теги карточки), если карточку с тегом AICheck
     перенесли в другой столбец, иначе (None, причина пропуска, "", set())."""
-    resource, reason = bug_resource(event, CHECK_TYPES)
+    resource, reason = get_bug_resource(event, CHECK_TYPES)
     if reason:
         return None, reason, "", set()
     change = (resource.get("fields") or {}).get("System.BoardColumn")
@@ -145,7 +145,7 @@ def select_column_move(event: dict) -> tuple[int | None, str, str, set[str]]:
     tags = parse_tags(((resource.get("revision") or {}).get("fields") or {}).get("System.Tags"))
     if CHECK_TAG.lower() not in tags:
         return None, f"нет тега {CHECK_TAG.lower()}", "", set()
-    bug_id, detail = bug_id_url(resource)
+    bug_id, detail = get_bug_id_by_url(resource)
     return bug_id, detail, column, tags
 
 
@@ -313,12 +313,12 @@ class HookHandler(BaseHTTPRequestHandler):
     server: HookServer
 
     def do_GET(self):
-        if handler := self.route({"/health": self.health}):
+        if handler := self.get_handler_by_route({"/health": self.health}):
             handler()
 
     def do_POST(self):
         """Общие проверки POST-запросов; обработчик endpoint получает разобранное JSON-тело."""
-        handler = self.route({HOOK_PATH: self.propose_fix, CHECK_PATH: self.check_work_item})
+        handler = self.get_handler_by_route({HOOK_PATH: self.propose_fix, CHECK_PATH: self.check_work_item})
         if handler is None:
             return
         if not self.authorized():
@@ -327,12 +327,13 @@ class HookHandler(BaseHTTPRequestHandler):
         if length > MAX_BODY:
             return self.reply(413, {"error": "payload too large"})
         try:
-            body = json.loads(self.rfile.read(length))
+            # Словарь с данными от хука TFS. Парсится строка вида: '"eventType": "workitem.updated", "resource": {"workItemId": 12345, ...}'
+            parsed_body = json.loads(self.rfile.read(length))
         except ValueError:
             return self.reply(400, {"error": "invalid json"})
-        handler(body)
+        handler(parsed_body)
 
-    def route(self, endpoints: dict):
+    def get_handler_by_route(self, endpoints: dict):
         """Обработчик endpoint по пути запроса (без query string); для неизвестного пути отвечает 404 и возвращает None."""
         handler = endpoints.get(urlsplit(self.path).path)
         if handler is None:
@@ -342,14 +343,14 @@ class HookHandler(BaseHTTPRequestHandler):
     def health(self):
         self.reply(200, {"status": "ok", "queued": self.server.runner.jobs.qsize()})
 
-    def propose_fix(self, event: dict):
+    def propose_fix(self, event_properties: dict):
         """Событие service hook TFS: ставит карточку в очередь на исправление."""
-        bug_id, detail, tags = select_bug(event, set(self.server.runner.repos))
+        bug_id, error_text, tags = select_bug(event_properties, set(self.server.runner.repos))
         if bug_id is None:
-            log.debug("Событие пропущено: %s", detail)
-            return self.reply(200, {"status": "ignored", "reason": detail})
+            log.debug("Событие пропущено: %s", error_text)
+            return self.reply(200, {"status": "ignored", "reason": error_text})
         allow_duplicate = self.query_flag(DUPLICATE_PARAM)
-        queued = self.queue_fix(bug_id, detail, tags, allow_duplicate)
+        queued = self.queue_fix(bug_id, error_text, tags, allow_duplicate)
         if not queued:
             return self.reply(200, {"status": "duplicate", "bug": bug_id, "tags": tags})
         # TFS ждет ответ недолго и повторяет запрос при ошибке, поэтому отвечаем сразу, а исправление идет в фоне.
@@ -437,6 +438,15 @@ def main():
     logging.basicConfig(level=logging.DEBUG if cfg.verbose else logging.INFO, handlers=handlers)
     if not cfg.credentials[1]:
         log.warning("BUGDAN_HOOK_PASSWORD не задан: запросы принимаются без проверки Basic-аутентификации")
+    try:
+        claude = find_claude()
+        log.info("Claude Code CLI: %s, версия %s", claude, claude_version())
+    except SystemExit as e:
+        log.error("%s", e.code)
+        raise
+    if Path(claude).suffix.lower() in (".cmd", ".bat"):
+        log.warning("claude запускается через %s, его аргументы разбирает cmd.exe: надежнее задать в CLAUDE_BIN "
+                    "путь до claude.exe", Path(claude).name)
 
     server = HookServer((HOST, PORT), cfg, Runner(repos, FIX_LOG_DIR))
     log.info("Жду события на http://%s:%s%s и %s, теги %s, %s и теги репозиториев: %s", HOST, PORT, HOOK_PATH,
