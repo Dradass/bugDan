@@ -11,7 +11,7 @@ from typing import Callable
 
 import requests
 
-from bug_fixer import SLUG_MODEL, TODO_COLUMN, ask_claude
+from bug_fixer import SLUG_MODEL, TODO_COLUMN, ask_claude, usage_summary
 from tfs import (COMMENT_PREFIX, History, PullRequest, WorkItem, add_workitem_comment, get_pull_request, html_to_text,
                  linked_commits, linked_pull_requests, load_history, load_workitem, mention_html, move_to_board_column,
                  same_person, set_workitem_tag)
@@ -128,7 +128,9 @@ def assignee_explanation(item: WorkItem, history: History, column: str) -> tuple
         return None, f"ответственный ({name}) не оставил комментариев и не дополнял текст бага"
     prompt = DECISION_PROMPT.format(column=column, id=item.id, title=item.title,
                                     notes="\n\n".join(notes)[-MAX_NOTES:])
-    answer = ask_claude(Path(__file__).resolve().parent, prompt, DECISION_MODEL, tools="", max_turns=1)["result"]
+    res = ask_claude(Path(__file__).resolve().parent, prompt, DECISION_MODEL, tools="", max_turns=1)
+    log.info("Карточка %s: оценка объяснения ответственного: %s", item.id, usage_summary(res))
+    answer = res["result"]
     verdict, _, reason = answer.strip().partition("\n")
     reason = reason.strip() or verdict
     if re.sub(r"\W", "", verdict).upper() != "ДА":

@@ -15,6 +15,8 @@ TODO_COLUMN, DEVELOPMENT_COLUMN = "TODO", "Development"
 MAX_ATTACHMENT_SIZE = 2 * 1024 * 1024  # Вложения карточки больше этого размера не скачиваются
 
 CLAUDE_TIMEOUT = 60 * 60  # Сколько секунд ждать завершения claude, после этого процесс останавливается
+FIX_MAX_TURNS = 150  # Сколько ходов (вызовов инструментов) Claude может сделать при исправлении
+READ_MAX_TURNS = 40  # То же для запросов без правок кода
 CLAUDE_HIDDEN_ENV = {"TFS_PAT", "BUGDAN_HOOK_USER", "BUGDAN_HOOK_PASSWORD"}  # Не передаются в окружение claude
 
 BUG_BLOCK = """Ты работаешь в репозитории {repo} (ветка {branch}).
@@ -183,9 +185,10 @@ def ask_claude(repo_path: Path, prompt: str, model: str, allow_edits: bool = Fal
     args = ["-p",
             "--output-format", "json",
             "--model", model,
-            "--max-turns", str(max_turns or (60 if allow_edits else 40))]
-    # Пустой список - отключить все инструменты (--allowedTools "" ничего не запрещает).
-    args += ["--allowedTools", tools] if tools else ["--tools", ""]
+            "--max-turns", str(max_turns or (FIX_MAX_TURNS if allow_edits else READ_MAX_TURNS))]
+    # --tools ограничивает набор доступных инструментов, --allowedTools - разрешает их без запроса.
+    # Без --tools Claude видит Bash/PowerShell и тратит ходы на вызовы, которые отклоняются.
+    args += ["--tools", tools] + (["--allowedTools", tools] if tools else [])
     if allow_edits:
         args += ["--permission-mode", "acceptEdits"]
     for directory in add_dirs:  # Папки вне репозитория, к которым Claude получает доступ (вложения карточки)
@@ -196,9 +199,21 @@ def ask_claude(repo_path: Path, prompt: str, model: str, allow_edits: bool = Fal
         res = json.loads(stdout)
     except json.JSONDecodeError:
         sys.exit(f"claude завершился с кодом {proc.returncode}\nstdout: {stdout}\nstderr: {decode_console(proc.stderr)}")
-    if res.get("is_error"):
-        sys.exit(f"Ошибка Claude: {res.get('result')}")
+    if res.get("is_error") or res.get("subtype", "success") != "success":
+        # При error_max_turns / error_during_execution поля result нет - выводим подтип и детали.
+        details = res.get("result") or "; ".join(map(str, res.get("errors") or [])) or "без описания"
+        sys.exit(f"Ошибка Claude ({res.get('subtype')}, ходов: {res.get('num_turns')}, "
+                 f"session: {res.get('session_id')}): {details}")
     return res
+
+
+def usage_summary(res: dict) -> str:
+    """Токены и стоимость запроса к Claude из JSON-ответа claude -p: входные (без кеша), записанные в кеш,
+    прочитанные из кеша, выходные."""
+    u = res.get("usage") or {}
+    return (f"tokens: in {u.get('input_tokens', 0)}, cache write {u.get('cache_creation_input_tokens', 0)}, "
+            f"cache read {u.get('cache_read_input_tokens', 0)}, out {u.get('output_tokens', 0)}; "
+            f"cost: ${res.get('total_cost_usd', 0):.4f}; turns: {res.get('num_turns')}; session: {res.get('session_id')}")
 
 
 SLUG_PROMPT = """Придумай короткое имя git-ветки для исправления бага.
@@ -259,6 +274,7 @@ def branch_slug(repo_path: Path, title: str, bug: str, prompt: str = SLUG_PROMPT
     try:
         res = ask_claude(repo_path, prompt.format(title=title, bug=bug[:4000]), SLUG_MODEL,
                          tools="", max_turns=1)
+        print(f"Постфикс ветки: {usage_summary(res)}", file=sys.stderr)
         words = kebab_words(res["result"].strip().splitlines()[0])
         if 2 <= len(words) <= 7:
             return "-".join(words)
@@ -417,7 +433,7 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     summary, accuracy = split_accuracy(res["result"].strip())
     print(summary)
     print(f"Точность: {accuracy or 'Claude не указал'}", file=sys.stderr)
-    print(f"\n---\ncost: ${res.get('total_cost_usd', 0):.2f}, session: {res.get('session_id')}", file=sys.stderr)
+    print(f"\n---\n{usage_summary(res)}", file=sys.stderr)
 
     if not git("status", "--porcelain", cwd=worktree):
         cleanup()
