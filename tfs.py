@@ -198,7 +198,7 @@ def add_required_reviewer(pr_url: str, person: dict) -> None:
     s = _session()
     reviewer_id = _identity_id(s, collection, person)
     r = s.put(f"{collection}/{project}/_apis/git/repositories/{repo}/pullRequests/{pr_id}/reviewers/{reviewer_id}",
-              params={"api-version": API_VERSION}, json={"vote": 0, "isRequired": True})
+              params={"api-version": API_VERSION}, json={"id": reviewer_id, "vote": 0, "isRequired": True})
     if not r.ok:
         raise RuntimeError(f"Не удалось добавить рецензента {person.get('displayName')} в pull request {pr_id}: "
                            f"HTTP {r.status_code} {r.text[:500]}")
