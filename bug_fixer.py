@@ -2,6 +2,7 @@ import html, json, os, re, shutil, subprocess, sys
 from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlsplit, urlunsplit
 
 from tfs import (Attachment, WorkItem, add_required_reviewer, add_workitem_comment, area_team, create_pull_request,
                  create_workitem_comment, download_attachments, find_base_branch, load_workitem, move_to_board_column,
@@ -108,7 +109,21 @@ def check_repo(path: Path) -> tuple[str, str, str]:
         name, remote_url, _ = line.split()
         remotes.setdefault(name, remote_url)
     url = remotes.get(remote) or sys.exit(f"В {path} нет remote {remote}")
-    return url, git("rev-parse", "--abbrev-ref", "HEAD", cwd=path), remote
+    if (clean := strip_userinfo(url)) != url:
+        print(f"Внимание: в адресе remote {remote} указаны учетные данные, они не используются в логах, "
+              f"запросах к модели и комментариях: {clean}", file=sys.stderr)
+    return clean, git("rev-parse", "--abbrev-ref", "HEAD", cwd=path), remote
+
+
+def strip_userinfo(url: str) -> str:
+    """Адрес без логина и пароля (токена): https://user:pat@host/... -> https://host/...
+    git по-прежнему работает с remote по имени и берет учетные данные из своего конфига."""
+    parts = urlsplit(url)
+    if not (parts.username or parts.password):
+        return url
+    host = parts.hostname or ""
+    host = f"[{host}]" if ":" in host else host  # IPv6
+    return urlunsplit(parts._replace(netloc=host + (f":{parts.port}" if parts.port else "")))
 
 
 def remote_branches(repo: Path, remote: str) -> set[str]:
