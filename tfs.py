@@ -113,9 +113,36 @@ def parse_team(url: str) -> str | None:
     return None
 
 
+ALLOWED_HOSTS: set[str] = set()  # Хосты TFS, которым можно отправлять учетные данные (задает allow_hosts)
+
+
+def allow_hosts(hosts) -> None:
+    """Задает хосты TFS, на которые разрешены запросы: ссылки из карточек и событий на другие хосты не загружаются,
+    чтобы PAT или Windows-аутентификация не ушли на чужой сервер."""
+    ALLOWED_HOSTS.clear()
+    ALLOWED_HOSTS.update(h.strip().lower() for h in hosts)
+
+
+def host_allowed(url: str) -> bool:
+    """Ведет ли ссылка на хост TFS из ALLOWED_HOSTS."""
+    return (urlparse(url).hostname or "").lower() in ALLOWED_HOSTS
+
+
+class _TfsSession(requests.Session):
+    """Сессия, которая отправляет запросы только на хосты из ALLOWED_HOSTS. Проверка в send, а не в request,
+    чтобы учетные данные не ушли на чужой хост и при редиректе."""
+
+    def send(self, request, **kwargs):
+        if not host_allowed(request.url):
+            raise ValueError(f"Хост {urlparse(request.url).hostname!r} не входит в список серверов TFS (tfs_hosts), "
+                             "запрос не отправлен")
+        return super().send(request, **kwargs)
+
+
 def _session() -> requests.Session:
-    """PAT из переменной TFS_PAT, иначе Windows-аутентификация текущего пользователя."""
-    s = requests.Session()
+    """PAT из переменной TFS_PAT, иначе Windows-аутентификация текущего пользователя.
+    Запросы отправляются только на хосты из ALLOWED_HOSTS."""
+    s = _TfsSession()
     pat = os.environ.get("TFS_PAT")
     if pat:
         s.auth = ("", pat)

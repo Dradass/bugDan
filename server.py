@@ -1,7 +1,7 @@
 """HTTP-сервер для service hook TFS: исправляет баг, User Story или Task (bug_fixer.fix_bug), когда на карточке
-оказываются тег AIFix и тег репозитория. Теги репозиториев, пути до них, необязательные файлы правил Claude
-и ветки по умолчанию задаются в config.json:
-{"tags": {"<тег>": {"repo": "<путь>", "rule": "<файл правила>", "default_branch": "<ветка>"}}}.
+оказываются тег AIFix и тег репозитория. Теги репозиториев, пути до них, необязательные файлы правил Claude,
+ветки по умолчанию и хосты TFS, на которые разрешены запросы, задаются в config.json:
+{"tfs_hosts": ["<хост>"], "tags": {"<тег>": {"repo": "<путь>", "rule": "<файл правила>", "default_branch": "<ветка>"}}}.
 
 Подписка в TFS: Project Settings -> Service hooks -> Web Hooks, событие "Work item updated",
 фильтры: тег AIFix, измененное поле Tags. Тег репозитория проверяет сервер.
@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from board_checker import CHECK_TAG, WARNING_TAG, check_board_column
 import bug_fixer
 from bug_fixer import FIX_TAG, CardComment, FixSkipped, claude_version, find_claude, fix_bug, use_models
-from tfs import set_workitem_tag
+from tfs import allow_hosts, host_allowed, set_workitem_tag
 
 HERE = Path(__file__).resolve().parent
 HOST, PORT = "0.0.0.0", 8080
@@ -110,9 +110,13 @@ def get_bug_resource(event_properties: dict, types: set[str] | None = None) -> t
 def get_bug_id_by_url(resource: dict) -> tuple[int | None, str]:
     """(номер карточки, ссылка) или (None, причина пропуска), если в событии нет данных карточки."""
     try:
-        return int(resource["workItemId"]), bug_url(resource)
+        bug_id, url = int(resource["workItemId"]), bug_url(resource)
     except (KeyError, TypeError, ValueError) as e:
         return None, f"в событии нет данных карточки: {e!r}"
+    if not host_allowed(url):
+        log.warning("Карточка %s: событие со ссылкой на хост вне tfs_hosts пропущено: %s", bug_id, url)
+        return None, "хост карточки не входит в tfs_hosts"
+    return bug_id, url
 
 
 def select_bug(event_properties: dict, repo_tags: set[str]) -> tuple[int | None, str, list[str]]:
@@ -158,6 +162,19 @@ def read_rule(path: Path) -> str:
         return path.read_text(encoding="utf-8-sig").strip()
     except (OSError, UnicodeDecodeError) as e:
         raise SystemExit(f"Не удалось прочитать файл правила {path}: {e}")
+
+
+def read_tfs_hosts(path: Path) -> list[str]:
+    """Хосты TFS из секции "tfs_hosts" конфига: только на них отправляются запросы с учетными данными."""
+    try:
+        hosts = json.loads(path.read_text(encoding="utf-8-sig")).get("tfs_hosts")
+    except (OSError, ValueError, AttributeError) as e:
+        raise SystemExit(f"Не удалось прочитать tfs_hosts из {path}: {e!r}")
+    if (not isinstance(hosts, list) or not hosts
+            or not all(isinstance(h, str) and re.fullmatch(r"[\w.-]+", h.strip()) for h in hosts)):
+        raise SystemExit(f'В {path} нужна секция "tfs_hosts" - непустой список хостов TFS без схемы, порта и пути, '
+                         'например ["tfs.example.com"]')
+    return [h.strip().lower() for h in hosts]
 
 
 class TimestampFormatter(logging.Formatter):
@@ -501,6 +518,8 @@ def main():
         p.error("с --model-url нужно указать --model и --model-key")
     use_models(cfg.model, cfg.slug_model, cfg.model_url, cfg.model_key)
     repos = read_repos(cfg.config.resolve())
+    tfs_hosts = read_tfs_hosts(cfg.config.resolve())
+    allow_hosts(tfs_hosts)
     cfg.credentials = os.environ.get("BUGDAN_HOOK_USER", ""), os.environ.get("BUGDAN_HOOK_PASSWORD", "")
 
     # Консоль службы Windows пишет в кодировке ANSI, поэтому основной лог дублируется в файл в UTF-8.
@@ -527,6 +546,7 @@ def main():
              CHECK_PATH, TRIGGER_TAG, CHECK_TAG,
              "; ".join(f"{t} -> {r.path} (правило Claude {r.rule or 'не задано'}, ветка по умолчанию {r.default_branch or 'не задана'})"
                        for t, r in repos.items()))
+    log.info("Хосты TFS, на которые разрешены запросы: %s", ", ".join(tfs_hosts))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

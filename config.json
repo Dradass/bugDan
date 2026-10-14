@@ -1,4 +1,5 @@
 {
+  "tfs_hosts": ["rxtfs.directum.ru", "tech.directum.ru"],
   "tags": {
     "Applied": {
       "repo": "D:\\Projects\\master\\RX",
