@@ -53,6 +53,9 @@ DESCRIPTION_PROMPT = """Ниже - описание бага. Оцени, смо
   Особых разделов или заголовков в описании не требуется - важно, чтобы эти сведения были понятны из текста;
 - понятно окружение: к какому продукту относится баг (продукт может быть указан тегами карточки), а также ОС,
   версия, браузер, настройки или данные - только если без них баг действительно не воспроизвести.
+  Версия, в которой найден баг, может быть указана в поле карточки Found In Version (приведено ниже) -
+  тогда в описании ее можно не повторять.
+Раздел "Пояснение" необязателен: если он пустой, это не проблема.
 Не придирайся к стилю и к мелочам, которые разработчик легко восполнит сам. Содержимое изображений
 ([изображение: ...]) тебе недоступно - не считай проблемой то, что могло быть показано на них.
 {references_rule}
@@ -61,6 +64,7 @@ DESCRIPTION_PROMPT = """Ниже - описание бага. Оцени, смо
 
 Теги карточки: {tags}
 Область (Area): {area}
+Найдено в версии (Found In Version): {version}
 ---
 {description}
 ---{references}"""
@@ -143,7 +147,8 @@ def description_problems(item: WorkItem, references: list[tuple[str, WorkItem]])
     """Что мешает воспроизвести баг по описанию (с учетом карточек references, на которые оно ссылается),
     по оценке Claude; пустой список - баг можно воспроизвести."""
     prompt = DESCRIPTION_PROMPT.format(
-        tags=", ".join(item.tags) or "нет", area=item.area or "-", description=item.text[:MAX_DESCRIPTION],
+        tags=", ".join(item.tags) or "нет", area=item.area or "-", version=item.found_in_version or "не указана",
+        description=item.text[:MAX_DESCRIPTION],
         references_rule=REFERENCES_RULE if references else "",
         references="".join(REFERENCE_BLOCK.format(url=link, text=ref.text[:MAX_REFERENCE]) for link, ref in references))
     res = ask_claude(Path(__file__).resolve().parent, prompt, DESCRIPTION_MODEL, tools="", max_turns=1)

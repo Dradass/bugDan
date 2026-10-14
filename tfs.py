@@ -21,6 +21,7 @@ TEXT_FIELDS = {
     "Microsoft.VSTS.Common.AcceptanceCriteria": "Критерии приемки",
     "Microsoft.VSTS.TCM.SystemInfo": "Системная информация",
 }
+FOUND_IN_VERSION_FIELD = "Custom.FoundInVersion"  # Поле карточки Found In Version: версия, в которой найден баг
 
 
 class _HtmlToText(HTMLParser):
@@ -328,8 +329,11 @@ def set_workitem_tag(url: str, tag: str, present: bool) -> bool:
     if has == present:
         return False
     tags = tags + [tag] if present else [t for t in tags if t.lower() != tag.lower()]
+    # Для System.Tags операция add только добавляет теги к уже стоящим (снять тег так нельзя: TFS отвечает 200
+    # без изменений), replace заменяет весь список. Тег снимается, только когда поле заполнено, - replace применим.
+    op = "add" if present else "replace"
     r = s.patch(f"{collection}/_apis/wit/workitems/{item_id}", params={"api-version": API_VERSION},
-                data=json.dumps([{"op": "add", "path": "/fields/System.Tags", "value": "; ".join(tags)}]),
+                data=json.dumps([{"op": op, "path": "/fields/System.Tags", "value": "; ".join(tags)}]),
                 headers={"Content-Type": "application/json-patch+json"})
     if not r.ok:
         raise RuntimeError(f"Не удалось {'поставить' if present else 'снять'} тег {tag} карточки #{item_id}: "
@@ -351,6 +355,7 @@ class WorkItem:
     assigned_to: dict | None = None  # IdentityRef ответственного (System.AssignedTo); None - не назначен
     tags: list[str] = field(default_factory=list)  # System.Tags
     referenced: list[str] = field(default_factory=list)  # Ссылки на другие карточки из полей TEXT_FIELDS
+    found_in_version: str = ""  # Found In Version (FOUND_IN_VERSION_FIELD): 26.3.0.0054
 
 
 # Ссылка на карточку: .../_workitems/edit/<номер> или ссылка на доску с ?workitem=<номер>
@@ -443,7 +448,8 @@ def load_workitem(url: str, with_comments: bool = True) -> WorkItem:
                     area=fields.get("System.AreaPath", ""),
                     assigned_to=_identity_ref(fields.get("System.AssignedTo")),
                     tags=parse_tags(fields.get("System.Tags")),
-                    referenced=_referenced_workitems([fields.get(name) or "" for name in TEXT_FIELDS], item_id))
+                    referenced=_referenced_workitems([fields.get(name) or "" for name in TEXT_FIELDS], item_id),
+                    found_in_version=str(fields.get(FOUND_IN_VERSION_FIELD) or ""))
 
 
 def same_person(a: dict | None, b: dict | None) -> bool:
