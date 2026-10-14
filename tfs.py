@@ -3,8 +3,8 @@ import difflib
 import json
 import os
 import re
-from dataclasses import dataclass
-from html import escape
+from dataclasses import dataclass, field
+from html import escape, unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote, unquote
@@ -323,8 +323,7 @@ def set_workitem_tag(url: str, tag: str, present: bool) -> bool:
     Возвращает False, если тег уже был в нужном состоянии и карточка не менялась."""
     collection, _, item_id = parse_workitem_url(url)
     s = _session()
-    tags = [t.strip() for t in (_get_item(s, collection, item_id)["fields"].get("System.Tags") or "").split(";")
-            if t.strip()]
+    tags = parse_tags(_get_item(s, collection, item_id)["fields"].get("System.Tags"))
     has = any(t.lower() == tag.lower() for t in tags)
     if has == present:
         return False
@@ -350,6 +349,30 @@ class WorkItem:
     comments: list[str]  # текст комментариев, от старых к новым
     area: str = ""  # System.AreaPath: SmartInstruments\Vega
     assigned_to: dict | None = None  # IdentityRef ответственного (System.AssignedTo); None - не назначен
+    tags: list[str] = field(default_factory=list)  # System.Tags
+    referenced: list[str] = field(default_factory=list)  # Ссылки на другие карточки из полей TEXT_FIELDS
+
+
+# Ссылка на карточку: .../_workitems/edit/<номер> или ссылка на доску с ?workitem=<номер>
+WORKITEM_LINK_RE = re.compile(r"https?://[^\s\"'<>]+?(?:/_workitems/edit/\d+|[?&]workitem=\d+)", re.IGNORECASE)
+
+
+def _referenced_workitems(html_fields: list[str], item_id: int) -> list[str]:
+    """Ссылки на другие карточки (кроме item_id) в HTML полей, по одной на номер карточки, в порядке появления."""
+    found = {}
+    for link in WORKITEM_LINK_RE.findall(unescape("\n".join(html_fields))):
+        try:
+            ref_id = parse_workitem_url(link)[2]
+        except ValueError:
+            continue
+        if ref_id != item_id:
+            found.setdefault(ref_id, link)
+    return list(found.values())
+
+
+def parse_tags(value: str | None) -> list[str]:
+    """Теги из поля System.Tags ("тег1; тег2")."""
+    return [t.strip() for t in (value or "").split(";") if t.strip()]
 
 
 def _identity_ref(value) -> dict | None:
@@ -418,7 +441,9 @@ def load_workitem(url: str, with_comments: bool = True) -> WorkItem:
                     relations=item.get("relations") or [],
                     comments=[text for _, text in comments],
                     area=fields.get("System.AreaPath", ""),
-                    assigned_to=_identity_ref(fields.get("System.AssignedTo")))
+                    assigned_to=_identity_ref(fields.get("System.AssignedTo")),
+                    tags=parse_tags(fields.get("System.Tags")),
+                    referenced=_referenced_workitems([fields.get(name) or "" for name in TEXT_FIELDS], item_id))
 
 
 def same_person(a: dict | None, b: dict | None) -> bool:
@@ -492,6 +517,7 @@ class History:
     comments: list[tuple[dict, str]]  # (автор - IdentityRef, HTML комментария), от старых к новым
     text_edits: list[TextEdit]  # Дополнения текстовых полей карточки, от старых к новым
     last_assigned_to: dict | None  # Последний, кто был указан в Assigned To (сейчас поле может быть пустым)
+    description_editor: dict | None = None  # Последний, кто изменял текстовые поля карточки (TEXT_FIELDS)
 
 
 def _added_text(old_html: str, new_html: str) -> str:
@@ -516,21 +542,24 @@ def _get_updates(s: requests.Session, collection: str, item_id: int) -> list[dic
 
 
 def load_history(item: WorkItem) -> History:
-    """Комментарии карточки с авторами, дополнения ее текстовых полей (TEXT_FIELDS) и последний ответственный
-    по истории изменений."""
+    """Комментарии карточки с авторами, дополнения ее текстовых полей (TEXT_FIELDS), последний ответственный
+    и последний, кто правил текстовые поля, по истории изменений."""
     s = _session()
-    edits, assigned = [], None
+    edits, assigned, editor = [], None, None
     for update in _get_updates(s, item.collection, item.id):
         author = _identity_ref(update.get("revisedBy")) or {}
         fields = update.get("fields") or {}
         for name, caption in TEXT_FIELDS.items():
             change = fields.get(name)
+            if isinstance(change, dict) and author and change.get("oldValue") != change.get("newValue"):
+                editor = author
             if isinstance(change, dict) and (added := _added_text(change.get("oldValue"), change.get("newValue"))):
                 edits.append(TextEdit(author, caption, added))
         # Когда ответственного убирают, newValue пустое, а oldValue - тот, кто был указан последним.
         if isinstance(change := fields.get("System.AssignedTo"), dict):
             assigned = _identity_ref(change.get("newValue")) or _identity_ref(change.get("oldValue")) or assigned
-    return History(_comment_records(s, item.collection, item.project, item.id), edits, item.assigned_to or assigned)
+    return History(_comment_records(s, item.collection, item.project, item.id), edits, item.assigned_to or assigned,
+                   editor)
 
 
 @dataclass

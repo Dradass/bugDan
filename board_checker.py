@@ -11,7 +11,7 @@ from typing import Callable
 
 import requests
 
-from bug_fixer import SLUG_MODEL, TODO_COLUMN, ask_claude, usage_summary
+from bug_fixer import MODEL, SLUG_MODEL, TODO_COLUMN, ask_claude, usage_summary
 from tfs import (COMMENT_PREFIX, History, PullRequest, WorkItem, add_workitem_comment, get_pull_request, html_to_text,
                  linked_commits, linked_pull_requests, load_history, load_workitem, mention_html, move_to_board_column,
                  same_person, set_workitem_tag)
@@ -19,10 +19,15 @@ from tfs import (COMMENT_PREFIX, History, PullRequest, WorkItem, add_workitem_co
 CHECK_TAG = "AICheck"  # Тег карточки, при котором выполняются проверки
 # Тег карточки, в которой нет информации о решении бага; по нему правило стиля доски красит карточку в коралловый
 WARNING_TAG = "AIWarning"
-ANALYSIS_COLUMN, READY_FOR_TESTING_COLUMN, CLOSED_COLUMN = "Analysis", "ReadyForTesting", "Closed"
+ANALYSIS_COLUMN, READY_FOR_DEV_COLUMN = "Analysis", "ReadyForDev"
+READY_FOR_TESTING_COLUMN, CLOSED_COLUMN = "ReadyForTesting", "Closed"
 FINALIZING_COLUMN = "Finalizing"  # Куда возвращается закрытая карточка, если ее решение не подтверждено
 DECISION_MODEL = SLUG_MODEL  # Модель, которая оценивает объяснение ответственного, почему баг не будет исправлен
 MAX_NOTES = 20000  # Сколько последних символов комментариев и дополнений ответственного передается Claude
+DESCRIPTION_MODEL = MODEL  # Модель, которая оценивает, можно ли воспроизвести баг по описанию
+MAX_DESCRIPTION = 20000  # Сколько первых символов описания бага передается Claude
+MAX_REFERENCES = 3  # Сколько карточек, на которые ссылается описание бага, передается Claude
+MAX_REFERENCE = 10000  # Сколько первых символов описания каждой из них передается Claude
 
 # Ссылка на pull request: https://<сервер>/<коллекция>/<проект>/_git/<репозиторий>/pullrequest/<номер>
 PR_LINK_RE = re.compile(r"https?://[^\s\"'<>]+/_git/[^/\s\"'<>]+/pullrequest/\d+", re.IGNORECASE)
@@ -39,6 +44,45 @@ DECISION_PROMPT = """Баг перенесен в столбец "{column}", н�
 ---
 {notes}
 ---"""
+
+DESCRIPTION_PROMPT = """Ниже - описание бага. Оцени, сможет ли разработчик однозначно воспроизвести баг по этому описанию.
+Проверь:
+- шаги воспроизведения понятны, последовательны и достаточны;
+- понятно, какой результат наблюдается и какой ожидается: оба описаны конкретно и не противоречат друг другу
+  и шагам (например, ожидаемый результат не совпадает с наблюдаемым и не пуст).
+  Особых разделов или заголовков в описании не требуется - важно, чтобы эти сведения были понятны из текста;
+- понятно окружение: к какому продукту относится баг (продукт может быть указан тегами карточки), а также ОС,
+  версия, браузер, настройки или данные - только если без них баг действительно не воспроизвести.
+Не придирайся к стилю и к мелочам, которые разработчик легко восполнит сам. Содержимое изображений
+([изображение: ...]) тебе недоступно - не считай проблемой то, что могло быть показано на них.
+{references_rule}
+Первой строкой ответь только "ДА" (баг можно воспроизвести) или "НЕТ". Если "НЕТ" - в следующих строках перечисли,
+что непонятно или чего не хватает, каждую проблему одной строкой, начинающейся с "- ".
+
+Теги карточки: {tags}
+Область (Area): {area}
+---
+{description}
+---{references}"""
+
+# Дописывается к DESCRIPTION_PROMPT, если описание бага ссылается на другие карточки
+REFERENCES_RULE = """Описание бага ссылается на другие карточки, их описания приведены ниже. Если в описании бага сказано,
+что он аналогичен другой карточке (те же шаги или требования, но, например, для другого продукта или компонента),
+шаги и результаты в нем можно не повторять: тогда оцени, понятно ли расписано в той карточке, что происходит
+и что ожидается, и ясно ли из описания бага, чем он от нее отличается."""
+
+# Описание связанной карточки в DESCRIPTION_PROMPT
+REFERENCE_BLOCK = """
+
+Связанная карточка {url}:
+---
+{text}
+---"""
+
+UNCLEAR_DESCRIPTION_COMMENT = """{person}, карточка перенесена в столбец {column}, но по описанию бага его не получится \
+однозначно воспроизвести:<br>
+{problems}<br>
+Уточните описание бага."""
 
 MISSING_DECISION_COMMENT = """{person}, карточка перенесена в столбец {column}, но в ней нет информации о решении бага.<br>
 {abandoned}Нужно одно из:<br>
@@ -81,6 +125,58 @@ def _run_check(check: Callable[[WorkItem, str, History], object], bug_id: int, u
 def check_description(bug_id: int, url: str) -> None:
     """Карточка перенесена в Analysis: проверка описания бага."""
     log.info("Карточка %s: Check bug description", bug_id)
+
+
+def referenced_items(item: WorkItem) -> list[tuple[str, WorkItem]]:
+    """(ссылка, карточка) для первых MAX_REFERENCES карточек, на которые ссылается описание бага.
+    Карточка, которую не удалось загрузить, пропускается с предупреждением в логе."""
+    found = []
+    for link in item.referenced[:MAX_REFERENCES]:
+        try:
+            found.append((link, load_workitem(link, with_comments=False)))
+        except (RuntimeError, ValueError, requests.RequestException) as e:
+            log.warning("Карточка %s: связанная карточка %s пропущена: %s", item.id, link, e)
+    return found
+
+
+def description_problems(item: WorkItem, references: list[tuple[str, WorkItem]]) -> list[str]:
+    """Что мешает воспроизвести баг по описанию (с учетом карточек references, на которые оно ссылается),
+    по оценке Claude; пустой список - баг можно воспроизвести."""
+    prompt = DESCRIPTION_PROMPT.format(
+        tags=", ".join(item.tags) or "нет", area=item.area or "-", description=item.text[:MAX_DESCRIPTION],
+        references_rule=REFERENCES_RULE if references else "",
+        references="".join(REFERENCE_BLOCK.format(url=link, text=ref.text[:MAX_REFERENCE]) for link, ref in references))
+    res = ask_claude(Path(__file__).resolve().parent, prompt, DESCRIPTION_MODEL, tools="", max_turns=1)
+    log.info("Карточка %s: оценка описания бага: %s", item.id, usage_summary(res))
+    verdict, _, details = res["result"].strip().partition("\n")
+    if re.sub(r"\W", "", verdict).upper() == "ДА":
+        return []
+    problems = [line.strip().lstrip("-*• ").strip() for line in details.splitlines() if line.strip()]
+    return problems or [verdict.strip() or "описание бага непонятно"]
+
+
+def check_bug_description(item: WorkItem, url: str, history: History) -> None:
+    """Проверяет, что баг можно воспроизвести по описанию (с учетом карточек, на которые оно ссылается).
+    Если нет - добавляет в карточку комментарий с упоминанием последнего, кто правил описание бага,
+    и тег WARNING_TAG, если да - снимает этот тег."""
+    if problems := description_problems(item, referenced_items(item)):
+        person = history.description_editor or history.last_assigned_to
+        add_workitem_comment(url, UNCLEAR_DESCRIPTION_COMMENT.format(
+            person=mention(url, person), column=html.escape(READY_FOR_DEV_COLUMN),
+            problems="<br>".join(f"- {html.escape(p)}" for p in problems)))
+        log.warning("Карточка %s: баг не воспроизвести по описанию (%s), в карточку добавлен комментарий", item.id,
+                    "; ".join(problems))
+        mark_warning(item, url, True)
+        return
+    log.info("Карточка %s: описание бага в порядке", item.id)
+    mark_warning(item, url, False)
+
+
+def check_ready_for_dev(bug_id: int, url: str) -> None:
+    """Карточка перенесена в ReadyForDev: проверка, что по описанию бага его можно воспроизвести (оценивает Claude).
+    Если нет, в карточку добавляется комментарий. Проверка идет в фоне."""
+    log.info("Карточка %s: проверка описания бага поставлена в очередь", bug_id)
+    _checks.submit(_run_check, check_bug_description, bug_id, url)
 
 
 def links_in_comments(comments: list[tuple[dict, str]], pattern: re.Pattern) -> list[str]:
@@ -293,6 +389,7 @@ def check_board_column(bug_id: int, url: str, column: str, fix: Callable[[int, s
     исправление (fix(bug_id, url) ставит его в очередь). False, если для этого столбца действия нет."""
     actions = {
         ANALYSIS_COLUMN: check_description,
+        READY_FOR_DEV_COLUMN: check_ready_for_dev,
         READY_FOR_TESTING_COLUMN: check_decision,
         CLOSED_COLUMN: check_closing,
         # Автоматическое исправление при переносе в TODO временно отключено: столбец не обрабатывается.
