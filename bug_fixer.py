@@ -15,7 +15,7 @@ TODO_COLUMN, DEVELOPMENT_COLUMN = "TODO", "Development"
 MAX_ATTACHMENT_SIZE = 2 * 1024 * 1024  # Вложения карточки больше этого размера не скачиваются
 
 CLAUDE_TIMEOUT = 60 * 60  # Сколько секунд ждать завершения claude, после этого процесс останавливается
-FIX_MAX_TURNS = 150  # Сколько ходов (вызовов инструментов) Claude может сделать при исправлении
+FIX_MAX_TURNS = 100  # Сколько ходов (вызовов инструментов) Claude может сделать при исправлении
 READ_MAX_TURNS = 40  # То же для запросов без правок кода
 CLAUDE_HIDDEN_ENV = {"TFS_PAT", "BUGDAN_HOOK_USER", "BUGDAN_HOOK_PASSWORD"}  # Не передаются в окружение claude
 

@@ -295,7 +295,8 @@ def check_board_column(bug_id: int, url: str, column: str, fix: Callable[[int, s
         ANALYSIS_COLUMN: check_description,
         READY_FOR_TESTING_COLUMN: check_decision,
         CLOSED_COLUMN: check_closing,
-        TODO_COLUMN: fix,
+        # Автоматическое исправление при переносе в TODO временно отключено: столбец не обрабатывается.
+        # TODO_COLUMN: fix,
     }
     action = next((a for name, a in actions.items() if name.lower() == column.strip().lower()), None)
     if action is None:
