@@ -147,7 +147,7 @@ def parse_git_url(url: str) -> tuple[str, str, str]:
 
 
 def create_pull_request(repo_url: str, source_branch: str, target_branch: str,
-                        title: str, description: str, template: str = "", draft: bool = True) -> str:
+                        title: str, description: str, template: str = "", draft: bool = False) -> str:
     """Создает pull request и возвращает ссылку на него.
     template - шаблон описания из репозитория, добавляется после description. Если описание не помещается
     в лимит TFS, в первую очередь обрезается description, но ему остается не меньше половины лимита."""
@@ -290,6 +290,31 @@ def add_workitem_comment(url: str, html: str) -> None:
                          headers={"Content-Type": "application/json-patch+json"})
     if not r.ok:
         raise RuntimeError(f"Не удалось добавить комментарий в карточку #{item_id}: "
+                           f"HTTP {r.status_code} {r.text[:500]}")
+
+
+EDIT_COMMENTS_API_VERSION = "7.1-preview.4"  # Новый API комментариев: создание с номером и правка комментария
+
+
+def create_workitem_comment(url: str, html: str) -> int:
+    """Добавляет комментарий (HTML) в карточку и возвращает его номер для update_workitem_comment.
+    Комментарий начинается с COMMENT_PREFIX."""
+    collection, project, item_id = parse_workitem_url(url)
+    r = _session().post(f"{collection}/{project}/_apis/wit/workItems/{item_id}/comments",
+                        params={"api-version": EDIT_COMMENTS_API_VERSION}, json={"text": COMMENT_PREFIX + html})
+    if not r.ok:
+        raise RuntimeError(f"Не удалось добавить комментарий в карточку #{item_id}: "
+                           f"HTTP {r.status_code} {r.text[:500]}")
+    return r.json()["id"]
+
+
+def update_workitem_comment(url: str, comment_id: int, html: str) -> None:
+    """Заменяет текст комментария карточки, созданного create_workitem_comment. Текст начинается с COMMENT_PREFIX."""
+    collection, project, item_id = parse_workitem_url(url)
+    r = _session().patch(f"{collection}/{project}/_apis/wit/workItems/{item_id}/comments/{comment_id}",
+                         params={"api-version": EDIT_COMMENTS_API_VERSION}, json={"text": COMMENT_PREFIX + html})
+    if not r.ok:
+        raise RuntimeError(f"Не удалось изменить комментарий {comment_id} карточки #{item_id}: "
                            f"HTTP {r.status_code} {r.text[:500]}")
 
 

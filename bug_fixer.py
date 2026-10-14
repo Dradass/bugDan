@@ -4,7 +4,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 from tfs import (Attachment, WorkItem, add_required_reviewer, add_workitem_comment, area_team, create_pull_request,
-                 download_attachments, find_base_branch, load_workitem, move_to_board_column, parse_team)
+                 create_workitem_comment, download_attachments, find_base_branch, load_workitem, move_to_board_column,
+                 parse_team, update_workitem_comment)
 
 MODEL = "claude-opus-5"
 SLUG_MODEL = "claude-haiku-4-5"  # Модель для постфикса имени ветки по сути бага
@@ -371,6 +372,24 @@ def no_fix_comment(summary: str, caption: str = BUG_TEXTS.no_change) -> str:
     return f"<b>{html.escape(caption)}</b><br>{text}"
 
 
+class CardComment:
+    """Комментарий бота в карточке, который дописывается по ходу работы. Пока он не создан (start),
+    каждое сообщение добавляется в карточку отдельным комментарием. Ошибки TFS - в RuntimeError."""
+
+    def __init__(self, url: str):
+        self.url, self.id, self.parts = url, None, []
+
+    def start(self, text: str) -> None:
+        self.id, self.parts = create_workitem_comment(self.url, text), [text]
+
+    def add(self, text: str) -> None:
+        if self.id is None:
+            add_workitem_comment(self.url, text)
+            return
+        self.parts.append(text)
+        update_workitem_comment(self.url, self.id, "<br><br>".join(self.parts))
+
+
 def attachments_block(directory: Path, attachments: list[Attachment]) -> str:
     """Блок запроса Claude со списком вложений карточки: скачанные и те, что получить не удалось."""
     saved = [f"- {a.path.name} ({a.size} байт)" for a in attachments if a.path]
@@ -382,7 +401,8 @@ def attachments_block(directory: Path, attachments: list[Attachment]) -> str:
 
 
 def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, base_sha: str, remote: str,
-                      item: WorkItem, allow_duplicate: bool = False, code_rules: str | None = None) -> None:
+                      item: WorkItem, comment: CardComment, allow_duplicate: bool = False,
+                      code_rules: str | None = None) -> None:
     bug_id, title, bug = item.id, item.title, item.text
     texts = texts_for(item.type)
     # Проверяем по префиксу и номеру бага до запуска Claude, чтобы не тратить на него вызовы.
@@ -438,12 +458,12 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     if not git("status", "--porcelain", cwd=worktree):
         cleanup()
         try:
-            add_workitem_comment(bug_url, with_accuracy(no_fix_comment(summary, texts.no_change), accuracy))
+            comment.add(with_accuracy(no_fix_comment(summary, texts.no_change), accuracy))
             print(f"В карточку #{bug_id} добавлен комментарий о том, что изменения в коде не требуются.",
                   file=sys.stderr)
         except Exception as e:
             print(f"Внимание: {e}", file=sys.stderr)
-        sys.exit("Claude не внес изменений в файлы, ветка не создана.")
+        raise FixSkipped("Claude не внес изменений в файлы, ветка не создана")
 
     # Постфикс запрашивается только когда ясно, что ветка нужна. Он может совпасть с уже существующей
     # веткой - тогда добавляем -2, -3...
@@ -467,7 +487,7 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
         print(f"Не удалось прочитать шаблон описания pull request: {e}", file=sys.stderr)
         template = ""
     pr_url = create_pull_request(repo_url, new_branch_name, base, f"#{bug_id} {title}", description,
-                                 template=template, draft=True)
+                                 template=template)
     print(f"Pull request {new_branch_name} -> {base}: {pr_url}", file=sys.stderr)
 
     # Pull request уже создан, поэтому ошибки рецензента и комментария не прерывают работу, а только выводятся в лог.
@@ -482,14 +502,14 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
 
     link = html.escape(pr_url)
     try:
-        add_workitem_comment(bug_url, with_accuracy(f'{texts.pr_link}: <a href="{link}">{link}</a>', accuracy))
+        comment.add(with_accuracy(f'{texts.pr_link}: <a href="{link}">{link}</a>', accuracy))
         print(f"В карточку #{bug_id} добавлен комментарий со ссылкой на pull request.", file=sys.stderr)
     except Exception as e:
         print(f"Внимание: {e}", file=sys.stderr)
 
 
 class FixSkipped(Exception):
-    """Исправление не запускалось (например, в карточке не указана ветка), ничего не изменено."""
+    """Исправление не выполнено, но это не ошибка: в карточке не указана ветка или Claude не внес изменений."""
 
 
 DEFAULT_BRANCH_NOTE = """
@@ -502,21 +522,24 @@ NO_BRANCH_COMMENT = """<b>Работа не начата: не указана в
 1. Свяжите ветку с карточкой в секции Development (Add link -&gt; Branch).<br>
 2. Напишите в комментарии карточки имя ветки после слова «ветка» или «branch», например: «ветка: vega/43383».<br>
 3. Сделайте то же в родительской User Story или Feature.<br>
-Ветка должна быть в репозитории на сервере. После добавления ветки снимите с карточки тег {tag} и поставьте его заново."""
+Ветка должна быть в репозитории на сервере. После добавления ветки поставьте на карточку тег {tag} заново (после обработки он снимается автоматически)."""
 FIX_TAG = "AIFix"  # Тег запуска исправления (подписка TFS), упоминается в комментарии NO_BRANCH_COMMENT
 
 
 def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False, code_rules: str | None = None,
-            default_branch: str | None = None, require_branch: bool = False) -> None:
-    """Исправляет баг или выполняет задачу (User Story, Task) в новой ветке: коммит, push и черновик pull request.
+            default_branch: str | None = None, require_branch: bool = False,
+            comment: CardComment | None = None) -> None:
+    """Исправляет баг или выполняет задачу (User Story, Task) в новой ветке: коммит, push и pull request.
     allow_duplicate - создать новую ветку, даже если ветка этого бага уже есть.
     code_rules - правила написания кода, которые Claude учитывает при исправлении.
     default_branch - базовая ветка, если в карточке и ее родителе ветка не найдена (в текст бага для Claude
     дописывается, что ветка взята по умолчанию). Если она не задана, в карточку добавляется комментарий о том,
     как указать ветку, и выбрасывается FixSkipped.
     require_branch - если ветка в карточке и ее родителе не найдена, не исправлять, а выбросить FixSkipped.
+    comment - комментарий в карточке, в который дописываются итоги; None - каждый итог отдельным комментарием.
     Ошибки завершаются через sys.exit("текст")."""
     repo_path = Path(repo_path)
+    comment = comment or CardComment(bug_url)
     repo_url, current, remote = check_repo(repo_path)
     print(f"Репозиторий: {repo_path} ({repo_url}), текущая ветка {current}", file=sys.stderr)
 
@@ -529,7 +552,7 @@ def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False, code_ru
         raise FixSkipped("в карточке и ее родительской User Story/Feature не указана ветка")
     elif default_branch is None:
         try:
-            add_workitem_comment(bug_url, NO_BRANCH_COMMENT.format(repo=html.escape(repo_url), tag=FIX_TAG))
+            comment.add(NO_BRANCH_COMMENT.format(repo=html.escape(repo_url), tag=FIX_TAG))
             commented = "в карточку добавлен комментарий о том, как указать ветку"
         except Exception as e:
             commented = f"комментарий в карточку добавить не удалось: {e}"
@@ -541,4 +564,4 @@ def fix_bug(bug_url: str, repo_path: str, allow_duplicate: bool = False, code_ru
     print(f"Базовая ветка: {base} ({source})", file=sys.stderr)
 
     base_sha = fetch_branch(repo_path, remote, base)
-    fix_in_new_branch(bug_url, repo_path, repo_url, base, base_sha, remote, item, allow_duplicate, code_rules)
+    fix_in_new_branch(bug_url, repo_path, repo_url, base, base_sha, remote, item, comment, allow_duplicate, code_rules)

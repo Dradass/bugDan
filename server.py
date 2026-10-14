@@ -12,7 +12,7 @@ Endpoint /check-work-item принимает то же событие для и�
 (board_checker).
     python server.py [--config config.json]
 """
-import argparse, base64, hmac, json, logging, os, queue, re, threading, traceback
+import argparse, base64, hmac, html, json, logging, os, queue, re, threading, traceback
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,7 +21,8 @@ from typing import NamedTuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from board_checker import CHECK_TAG, WARNING_TAG, check_board_column
-from bug_fixer import FIX_TAG, FixSkipped, claude_version, find_claude, fix_bug
+from bug_fixer import FIX_TAG, CardComment, FixSkipped, claude_version, find_claude, fix_bug
+from tfs import set_workitem_tag
 
 HERE = Path(__file__).resolve().parent
 HOST, PORT = "0.0.0.0", 8080
@@ -252,40 +253,71 @@ def read_repos(path: Path) -> dict[str, Repo]:
     return repos
 
 
+START_COMMENT = "Исправление запущено по тегу AIFix (репозиторий {tag})."  # Комментарий о начале работы
+ERROR_COMMENT_LIMIT = 2000  # Сколько символов текста ошибки попадает в комментарий карточки
+
+
+def error_comment(error: str) -> str:
+    """HTML дополнения комментария карточки об ошибке исправления."""
+    if len(error) > ERROR_COMMENT_LIMIT:
+        error = error[:ERROR_COMMENT_LIMIT].rstrip() + " [...обрезано]"
+    return "<b>Ошибка:</b><br>" + "<br>".join(html.escape(line) for line in error.strip().splitlines())
+
+
+def remove_fix_tag(bug_id: int, url: str):
+    """Снимает с карточки тег AIFix после обработки, чтобы его можно было поставить снова для повторного запуска.
+    Ошибка только пишется в лог."""
+    try:
+        if set_workitem_tag(url, TRIGGER_TAG, present=False):
+            log.info("Карточка %s: тег %s снят", bug_id, TRIGGER_TAG)
+    except Exception as e:
+        log.warning("Карточка %s: не удалось снять тег %s: %s", bug_id, TRIGGER_TAG, e)
+
+
 class Runner:
     """Очередь исправлений: по одному за раз, чтобы параллельные git fetch не мешали друг другу в одном репозитории."""
 
     def __init__(self, repos: dict[str, Repo], log_dir: Path):
         self.repos, self.log_dir = repos, log_dir
         self.jobs: queue.Queue[tuple[int, str, str, bool, bool]] = queue.Queue()
-        self.pending: set[tuple[int, str]] = set()
+        self.pending: dict[tuple[int, str], bool] = {}  # (карточка, тег) -> запуск по тегу AIFix
         self.lock = threading.Lock()
         threading.Thread(target=self._work, daemon=True).start()
 
     def submit(self, bug_id: int, url: str, tag: str, allow_duplicate: bool = False,
-               require_branch: bool = False) -> bool:
+               require_branch: bool = False, by_fix_tag: bool = False) -> bool:
         """Ставит карточку в очередь на исправление в репозитории тега; False, если она уже ждет
         или обрабатывается в этом репозитории (повтор события). require_branch - не исправлять,
-        если в карточке не указана ветка (иначе берется ветка репозитория по умолчанию)."""
+        если в карточке не указана ветка (иначе берется ветка репозитория по умолчанию).
+        by_fix_tag - запуск по тегу AIFix: после обработки тег снимается с карточки."""
         with self.lock:
             if (bug_id, tag) in self.pending:
+                self.pending[(bug_id, tag)] |= by_fix_tag  # AIFix снимется и после уже идущего запуска
                 return False
-            self.pending.add((bug_id, tag))
+            self.pending[(bug_id, tag)] = by_fix_tag
         self.jobs.put((bug_id, url, tag, allow_duplicate, require_branch))
         return True
 
     def _work(self):
         while True:
             bug_id, url, tag, allow_duplicate, require_branch = self.jobs.get()
+            with self.lock:
+                by_fix_tag = self.pending[(bug_id, tag)]
             try:
-                self._run(bug_id, url, tag, allow_duplicate, require_branch)
+                self._run(bug_id, url, tag, allow_duplicate, require_branch, by_fix_tag)
             except Exception:
                 log.exception("Карточка %s (%s): ошибка запуска", bug_id, tag)
             finally:
                 with self.lock:
-                    self.pending.discard((bug_id, tag))
+                    by_fix_tag = self.pending.pop((bug_id, tag))
+                    # Если AIFix запустил исправление в нескольких репозиториях, тег снимается после последнего.
+                    last = not any(fix for (b, _), fix in self.pending.items() if b == bug_id)
+            if by_fix_tag and last:
+                remove_fix_tag(bug_id, url)
 
-    def _run(self, bug_id: int, url: str, tag: str, allow_duplicate: bool, require_branch: bool):
+    def _run(self, bug_id: int, url: str, tag: str, allow_duplicate: bool, require_branch: bool, by_fix_tag: bool):
+        """Исправление карточки в репозитории тега. При запуске по AIFix в карточку добавляется комментарий
+        о начале работы, а итог или ошибка дописываются в него."""
         repo = self.repos[tag]
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log_file = self.log_dir / f"{bug_id}-{tag}-{datetime.now():%Y%m%d-%H%M%S}.log"
@@ -295,20 +327,31 @@ class Runner:
             print(f"bug-url: {url}\ntag: {tag}\nrepo-path: {repo.path}\nallow-duplicate: {allow_duplicate}\n"
                   f"claude-rule: {repo.rule or '-'}\ndefault-branch: {repo.default_branch or '-'}\n"
                   f"require-branch: {require_branch}\n")
+            comment = CardComment(url)
+            if by_fix_tag:
+                try:
+                    comment.start(START_COMMENT.format(tag=html.escape(tag)))
+                except Exception as e:
+                    print(f"Внимание: {e}")
             try:
                 # Файл правила читается при каждом запуске, чтобы его правки применялись без перезапуска сервера.
                 rules = read_rule(repo.rule) if repo.rule else None
-                fix_bug(url, str(repo.path), allow_duplicate, rules, repo.default_branch, require_branch)
+                fix_bug(url, str(repo.path), allow_duplicate, rules, repo.default_branch, require_branch, comment)
                 error = skipped = None
             except FixSkipped as e:
                 error, skipped = None, str(e)
                 print(f"Исправление пропущено: {skipped}")
             except SystemExit as e:  # bug_fixer сообщает об ошибке через sys.exit("текст")
-                error, skipped = e.code, None
+                error, skipped = str(e.code), None
                 print(error)
-            except Exception:
-                error, skipped = traceback.format_exc(), None
-                print(error)
+            except Exception as e:
+                error, skipped = f"{type(e).__name__}: {e}", None
+                print(traceback.format_exc())
+            if error and comment.id is not None:  # Ошибка дописывается только в комментарий о начале работы
+                try:
+                    comment.add(error_comment(error))
+                except Exception as e:
+                    print(f"Внимание: {e}")
         if skipped:
             log.warning("Карточка %s (%s): исправление пропущено, %s", bug_id, tag, skipped)
         elif error:
@@ -366,7 +409,7 @@ class HookHandler(BaseHTTPRequestHandler):
             log.debug("Событие пропущено: %s", error_text)
             return self.reply(200, {"status": "ignored", "reason": error_text})
         allow_duplicate = self.query_flag(DUPLICATE_PARAM)
-        queued = self.queue_fix(bug_id, error_text, tags, allow_duplicate)
+        queued = self.queue_fix(bug_id, error_text, tags, allow_duplicate, by_fix_tag=True)
         if not queued:
             return self.reply(200, {"status": "duplicate", "bug": bug_id, "tags": tags})
         # TFS ждет ответ недолго и повторяет запрос при ошибке, поэтому отвечаем сразу, а исправление идет в фоне.
@@ -396,11 +439,11 @@ class HookHandler(BaseHTTPRequestHandler):
         self.reply(200, {"status": "processed", "bug": bug_id, "column": column})
 
     def queue_fix(self, bug_id: int, url: str, tags: list[str], allow_duplicate: bool,
-                  require_branch: bool = False) -> list[str]:
+                  require_branch: bool = False, by_fix_tag: bool = False) -> list[str]:
         """Ставит карточку в очередь на исправление в репозиториях тегов; возвращает теги, по которым поставлена."""
         queued = []
         for tag in tags:
-            if not self.server.runner.submit(bug_id, url, tag, allow_duplicate, require_branch):
+            if not self.server.runner.submit(bug_id, url, tag, allow_duplicate, require_branch, by_fix_tag):
                 log.info("Карточка %s (%s) уже в очереди, повтор события пропущен", bug_id, tag)
                 continue
             queued.append(tag)
