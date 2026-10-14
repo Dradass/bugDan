@@ -11,7 +11,8 @@ from typing import Callable
 
 import requests
 
-from bug_fixer import MODEL, SLUG_MODEL, TODO_COLUMN, ask_claude, usage_summary
+import bug_fixer
+from bug_fixer import TODO_COLUMN, ask_claude, usage_summary
 from tfs import (COMMENT_PREFIX, History, PullRequest, WorkItem, add_workitem_comment, get_pull_request, html_to_text,
                  linked_commits, linked_pull_requests, load_history, load_workitem, mention_html, move_to_board_column,
                  same_person, set_workitem_tag)
@@ -22,9 +23,10 @@ WARNING_TAG = "AIWarning"
 ANALYSIS_COLUMN, READY_FOR_DEV_COLUMN = "Analysis", "ReadyForDev"
 READY_FOR_TESTING_COLUMN, CLOSED_COLUMN = "ReadyForTesting", "Closed"
 FINALIZING_COLUMN = "Finalizing"  # Куда возвращается закрытая карточка, если ее решение не подтверждено
-DECISION_MODEL = SLUG_MODEL  # Модель, которая оценивает объяснение ответственного, почему баг не будет исправлен
+# Модель, которая оценивает объяснение ответственного, почему баг не будет исправлен; None - bug_fixer.SLUG_MODEL
+DECISION_MODEL: str | None = None
 MAX_NOTES = 20000  # Сколько последних символов комментариев и дополнений ответственного передается Claude
-DESCRIPTION_MODEL = MODEL  # Модель, которая оценивает, можно ли воспроизвести баг по описанию
+DESCRIPTION_MODEL: str | None = None  # Модель, которая оценивает, можно ли воспроизвести баг по описанию; None - bug_fixer.MODEL
 MAX_DESCRIPTION = 20000  # Сколько первых символов описания бага передается Claude
 MAX_REFERENCES = 3  # Сколько карточек, на которые ссылается описание бага, передается Claude
 MAX_REFERENCE = 10000  # Сколько первых символов описания каждой из них передается Claude
@@ -151,7 +153,8 @@ def description_problems(item: WorkItem, references: list[tuple[str, WorkItem]])
         description=item.text[:MAX_DESCRIPTION],
         references_rule=REFERENCES_RULE if references else "",
         references="".join(REFERENCE_BLOCK.format(url=link, text=ref.text[:MAX_REFERENCE]) for link, ref in references))
-    res = ask_claude(Path(__file__).resolve().parent, prompt, DESCRIPTION_MODEL, tools="", max_turns=1)
+    res = ask_claude(Path(__file__).resolve().parent, prompt, DESCRIPTION_MODEL or bug_fixer.MODEL, tools="",
+                     max_turns=1)
     log.info("Карточка %s: оценка описания бага: %s", item.id, usage_summary(res))
     verdict, _, details = res["result"].strip().partition("\n")
     if re.sub(r"\W", "", verdict).upper() == "ДА":
@@ -229,7 +232,8 @@ def assignee_explanation(item: WorkItem, history: History, column: str) -> tuple
         return None, f"ответственный ({name}) не оставил комментариев и не дополнял текст бага"
     prompt = DECISION_PROMPT.format(column=column, id=item.id, title=item.title,
                                     notes="\n\n".join(notes)[-MAX_NOTES:])
-    res = ask_claude(Path(__file__).resolve().parent, prompt, DECISION_MODEL, tools="", max_turns=1)
+    res = ask_claude(Path(__file__).resolve().parent, prompt, DECISION_MODEL or bug_fixer.SLUG_MODEL, tools="",
+                     max_turns=1)
     log.info("Карточка %s: оценка объяснения ответственного: %s", item.id, usage_summary(res))
     answer = res["result"]
     verdict, _, reason = answer.strip().partition("\n")

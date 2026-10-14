@@ -21,7 +21,8 @@ from typing import NamedTuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from board_checker import CHECK_TAG, WARNING_TAG, check_board_column
-from bug_fixer import FIX_TAG, CardComment, FixSkipped, claude_version, find_claude, fix_bug
+import bug_fixer
+from bug_fixer import FIX_TAG, CardComment, FixSkipped, claude_version, find_claude, fix_bug, use_models
 from tfs import set_workitem_tag
 
 HERE = Path(__file__).resolve().parent
@@ -488,7 +489,17 @@ def main():
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                    help=f"Путь до конфига с тегами репозиториев (по умолчанию {DEFAULT_CONFIG.name} рядом с server.py)")
     p.add_argument("--verbose", action="store_true", help="Писать в лог пропущенные события и HTTP-запросы")
+    p.add_argument("--model", help=f"Модель для исправления и оценки описания бага (по умолчанию {bug_fixer.MODEL}); "
+                                   "с --model-url - имя модели на ее сервере")
+    p.add_argument("--slug-model", help=f"Модель для имени ветки и оценки объяснения ответственного (по умолчанию "
+                                        f"{bug_fixer.SLUG_MODEL}, с --model-url - как --model)")
+    p.add_argument("--model-url", help="Адрес своего сервера модели с Anthropic Messages API вместо Claude, например "
+                                       "прокси LiteLLM http://127.0.0.1:4000; нужны --model и --model-key")
+    p.add_argument("--model-key", help="Ключ своего сервера модели (master_key прокси LiteLLM) для --model-url")
     cfg = p.parse_args()
+    if cfg.model_url and not (cfg.model and cfg.model_key):
+        p.error("с --model-url нужно указать --model и --model-key")
+    use_models(cfg.model, cfg.slug_model, cfg.model_url, cfg.model_key)
     repos = read_repos(cfg.config.resolve())
     cfg.credentials = os.environ.get("BUGDAN_HOOK_USER", ""), os.environ.get("BUGDAN_HOOK_PASSWORD", "")
 
@@ -502,6 +513,8 @@ def main():
     try:
         claude = find_claude()
         log.info("Claude Code CLI: %s, версия %s", claude, claude_version())
+        log.info("Модели: %s, %s (короткие запросы), сервер: %s", bug_fixer.MODEL, bug_fixer.SLUG_MODEL,
+                 cfg.model_url or "Anthropic")
     except SystemExit as e:
         log.error("%s", e.code)
         raise

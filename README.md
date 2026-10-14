@@ -100,7 +100,7 @@ python server.py
 
 Параметры сервера: `--config` (путь до конфига, по умолчанию `config.json` рядом с `server.py`; конфиг
 и пути в нем проверяются при запуске), `--verbose` (писать в лог и пропущенные события).
-Модели Claude задаются константами `MODEL` и `SLUG_MODEL` в `bug_fixer.py`. Адрес и порт (`0.0.0.0:8080`), путь вебхука (`/propose-fix`), типы карточек для AIFix (`Bug`, `User Story`, `Task`)
+Модели задаются константами `MODEL` и `SLUG_MODEL` в `bug_fixer.py` или аргументами `--model`, `--slug-model` (и `--model-url` для своей модели, см. ниже). Адрес и порт (`0.0.0.0:8080`), путь вебхука (`/propose-fix`), типы карточек для AIFix (`Bug`, `User Story`, `Task`)
 и для AICheck (`Bug`) и папка логов задаются константами `HOST`, `PORT`, `HOOK_PATH`, `FIX_TYPES`, `CHECK_TYPES`, `LOG_DIR` в начале `server.py`.
 Проверка работы: `GET http://<хост>:8080/health`.
 
@@ -235,5 +235,27 @@ TFS не позволяет задать цвет отдельной карто�
   Путь и версия CLI проверяются и пишутся в лог при запуске сервера. `TFS_PAT`, `BUGDAN_HOOK_USER`
   и `BUGDAN_HOOK_PASSWORD` в окружение `claude` не передаются. Если `claude` не завершился за `CLAUDE_TIMEOUT`
   (60 минут, константа в `bug_fixer.py`), процесс останавливается вместе с дочерними.
+
+  **Своя модель.** Вместо Claude можно использовать свою модель (например, Qwen на сервере с vLLM), если сервер
+  поддерживает для нее вызов инструментов (`tools` / `tool_calls`). Модель и адрес ее сервера задаются аргументами
+  `server.py`: `--model-url` (адрес сервера с Anthropic Messages API `/v1/messages`), `--model-key` (его ключ),
+  `--model` и при необходимости `--slug-model`. Сервер bugDan передает их только в окружение процесса `claude` (`ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_DEFAULT_*_MODEL` - чтобы служебные запросы Claude Code тоже шли в эту модель, и запрет обращений
+  к сервисам Anthropic), а `claude` запускается с уровнем рассуждений `LOCAL_MODEL_EFFORT` (`medium`).
+
+  `claude` работает только с Anthropic Messages API. Если у сервера модели есть только OpenAI API
+  (`/v1/chat/completions`), на машине bugDan запускается прокси LiteLLM (в отдельном виртуальном окружении,
+  у него много зависимостей). Его конфиг - копия `litellm.example.yaml` в `litellm.yaml` (не попадает в git)
+  с адресом и ключом сервера модели и ключом самого прокси (`master_key`, без него LiteLLM не запускается).
+  Конфиг должен быть только в ASCII: LiteLLM читает его в кодировке Windows по умолчанию:
+
+  ```powershell
+  python -m venv D:\litellm-venv
+  D:\litellm-venv\Scripts\python.exe -m pip install "litellm[proxy]"
+  D:\litellm-venv\Scripts\litellm.exe --config litellm.yaml --host 127.0.0.1 --port 4000
+  .venv\Scripts\python.exe server.py --model-url http://127.0.0.1:4000 --model Qwen/Qwen3.8-27B --model-key <master_key>
+  ```
+
+  Прокси слушает только `127.0.0.1`. Стоимость в логе (`cost`) при этом считается по ценам Anthropic и не имеет смысла; токены и ходы - верные.
 - **Вебхук.** Входящие запросы от TFS проверяются Basic-аутентификацией с логином и паролем
   из `BUGDAN_HOOK_USER` / `BUGDAN_HOOK_PASSWORD`; их же указывают в подписке service hook.

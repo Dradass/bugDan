@@ -23,3 +23,6 @@ Desktop.ini
 
 # Логи server.py
 logs/
+
+# Конфиг прокси LiteLLM с адресом и ключом сервера модели (шаблон - litellm.example.yaml)
+litellm.yaml

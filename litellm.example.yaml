@@ -1,0 +1,23 @@
+# LiteLLM proxy between claude and a model server that has only the OpenAI API (/v1/chat/completions):
+# accepts claude requests in the Anthropic format (/v1/messages) and translates them to OpenAI and back,
+# including tool calls. Copy this file to litellm.yaml (ignored by git) and fill in your values.
+# Keep this file ASCII-only: LiteLLM reads it in the Windows default encoding (cp1251), not UTF-8.
+# Run: litellm --config litellm.yaml --host 127.0.0.1 --port 4000
+# bugDan server: python server.py --model-url http://127.0.0.1:4000 --model Qwen/Qwen3.8-27B --model-key <master_key>
+model_list:
+  - model_name: Qwen/Qwen3.8-27B              # Name used by bugDan (server --model)
+    litellm_params:
+      model: openai/Qwen/Qwen3.8-27B          # openai/ + model id on its server (from /v1/models)
+      api_base: http://<gpu-server>:8000/v1   # Model server address, with /v1
+      api_key: none                           # Model server key; none if not required
+
+litellm_settings:
+  drop_params: true  # Drop Anthropic parameters missing in the OpenAI API instead of failing
+  # Translate /v1/messages to /v1/chat/completions: for openai/ models LiteLLM uses the OpenAI Responses API
+  # (/v1/responses) by default, which the model server does not support ("unsupported API endpoint")
+  use_chat_completions_url_for_anthropic_messages: true
+
+# Key for requests to the proxy (LiteLLM refuses to start without it): a long random string starting with sk-.
+# Pass the same value to the bugDan server: --model-key <master_key>
+general_settings:
+  master_key: sk-<random string, e.g. python -c "import secrets; print(secrets.token_hex(32))">

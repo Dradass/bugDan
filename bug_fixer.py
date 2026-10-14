@@ -7,6 +7,7 @@ from tfs import (Attachment, WorkItem, add_required_reviewer, add_workitem_comme
                  create_workitem_comment, download_attachments, find_base_branch, load_workitem, move_to_board_column,
                  parse_team, update_workitem_comment)
 
+# Модели можно задать аргументами сервера (use_models), в том числе модель на своем сервере.
 MODEL = "claude-opus-5"
 SLUG_MODEL = "claude-haiku-4-5"  # Модель для постфикса имени ветки по сути бага
 
@@ -19,6 +20,10 @@ CLAUDE_TIMEOUT = 60 * 60  # Сколько секунд ждать заверш�
 FIX_MAX_TURNS = 100  # Сколько ходов (вызовов инструментов) Claude может сделать при исправлении
 READ_MAX_TURNS = 40  # То же для запросов без правок кода
 CLAUDE_HIDDEN_ENV = {"TFS_PAT", "BUGDAN_HOOK_USER", "BUGDAN_HOOK_PASSWORD"}  # Не передаются в окружение claude
+_model_env: dict[str, str] = {}  # Окружение claude для своего сервера модели (use_models)
+# Уровень рассуждений для своей модели: Claude Code по умолчанию передает high, а сервер модели
+# принимает только xhigh, medium и low (через LiteLLM - reasoning_effort)
+LOCAL_MODEL_EFFORT = "medium"
 
 BUG_BLOCK = """Ты работаешь в репозитории {repo} (ветка {branch}).
 Описание бага:
@@ -150,11 +155,32 @@ def find_claude() -> str:
     return _claude_bin
 
 
+def use_models(model: str | None = None, slug_model: str | None = None, base_url: str | None = None,
+               api_key: str | None = None) -> None:
+    """Задает модели вместо MODEL и SLUG_MODEL. base_url - адрес своего сервера модели с Anthropic Messages API
+    (например, прокси LiteLLM перед моделью с OpenAI API): все запросы claude, и служебные тоже, идут в него,
+    к модели model с ключом api_key (master_key прокси); slug_model по умолчанию та же.
+    Настройки передаются только в окружение процесса claude."""
+    global MODEL, SLUG_MODEL
+    if base_url and not (model and api_key):
+        raise ValueError("Для своего сервера модели нужно указать имя модели и ключ")
+    MODEL = model or MODEL
+    SLUG_MODEL = slug_model or (model if base_url else SLUG_MODEL)
+    _model_env.clear()
+    if base_url:
+        _model_env.update({"ANTHROPIC_BASE_URL": base_url.rstrip("/"), "ANTHROPIC_AUTH_TOKEN": api_key,
+                           "ANTHROPIC_DEFAULT_OPUS_MODEL": MODEL, "ANTHROPIC_DEFAULT_SONNET_MODEL": MODEL,
+                           "ANTHROPIC_DEFAULT_HAIKU_MODEL": SLUG_MODEL,
+                           "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"})  # Без обращений к сервисам Anthropic
+
+
 def run_claude(args: list[str], timeout: int, input: bytes = b"", cwd: Path | None = None) -> subprocess.CompletedProcess:
     """Запускает claude без секретов сервера в окружении. Если он не завершился за timeout секунд,
     завершает его вместе с дочерними процессами. Ошибки - через sys.exit."""
     claude = find_claude()
     env = {k: v for k, v in os.environ.items() if k.upper() not in CLAUDE_HIDDEN_ENV}
+    if _model_env:  # Свой сервер модели: ключ API Anthropic из окружения не должен перебить его ключ
+        env = {k: v for k, v in env.items() if k.upper() != "ANTHROPIC_API_KEY"} | _model_env
     try:
         proc = subprocess.Popen([claude, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, cwd=cwd, env=env)
@@ -187,6 +213,8 @@ def ask_claude(repo_path: Path, prompt: str, model: str, allow_edits: bool = Fal
             "--output-format", "json",
             "--model", model,
             "--max-turns", str(max_turns or (FIX_MAX_TURNS if allow_edits else READ_MAX_TURNS))]
+    if _model_env:
+        args += ["--effort", LOCAL_MODEL_EFFORT]
     # --tools ограничивает набор доступных инструментов, --allowedTools - разрешает их без запроса.
     # Без --tools Claude видит Bash/PowerShell и тратит ходы на вызовы, которые отклоняются.
     args += ["--tools", tools] + (["--allowedTools", tools] if tools else [])
