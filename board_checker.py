@@ -236,8 +236,16 @@ def assignee_explanation(item: WorkItem, history: History, column: str) -> tuple
 
 
 def mention(url: str, person: dict | None) -> str:
-    """HTML упоминания последнего ответственного в начале комментария карточки."""
+    """HTML упоминания человека в начале комментария карточки."""
     return mention_html(url, person) if person else "Ответственный не указан"
+
+
+def addressee(history: History, column: str) -> dict | None:
+    """Кому адресован комментарий о проблеме при переносе в столбец column: при переносе в Closed - тому,
+    кто перенес карточку (если его не найти - последнему ответственному), иначе - последнему ответственному."""
+    if column == CLOSED_COLUMN:
+        return history.moved_by(CLOSED_COLUMN) or history.last_assigned_to
+    return history.last_assigned_to
 
 
 def pull_requests(item: WorkItem, history: History) -> list[PullRequest]:
@@ -260,14 +268,14 @@ def pr_list_html(prs: list[PullRequest]) -> str:
 
 
 def unfinished_pr_comment(url: str, person: dict | None, prs: list[PullRequest], moved: str) -> str:
-    """HTML комментария о незавершенных pull request с упоминанием последнего ответственного."""
+    """HTML комментария о незавершенных pull request с упоминанием person."""
     return UNFINISHED_PR_COMMENT.format(person=mention(url, person), column=html.escape(CLOSED_COLUMN),
                                         prs=pr_list_html(prs), moved=html.escape(moved))
 
 
 def missing_decision_comment(url: str, person: dict | None, column: str, missing: str,
                              abandoned: list[PullRequest], moved: str = "") -> str:
-    """HTML комментария о том, что в карточке нет информации о решении бага, с упоминанием последнего ответственного.
+    """HTML комментария о том, что в карточке нет информации о решении бага, с упоминанием person.
     abandoned - отмененные pull request карточки (у нее нет других), moved - итог возврата карточки из Closed."""
     return MISSING_DECISION_COMMENT.format(
         person=mention(url, person), column=html.escape(column), explanation=html.escape(missing),
@@ -344,7 +352,7 @@ def check_solve_evidence(item: WorkItem, url: str, history: History, column: str
         mark_warning(item, url, False)
         return evidence
     moved = return_to_finalizing(item, url) if column == CLOSED_COLUMN else ""
-    add_workitem_comment(url, missing_decision_comment(url, history.last_assigned_to, column, evidence.missing,
+    add_workitem_comment(url, missing_decision_comment(url, addressee(history, column), column, evidence.missing,
                                                        evidence.abandoned, moved))
     log.warning("Карточка %s: нет информации о решении бага (%s%s), в карточку добавлен комментарий", item.id,
                 evidence.missing,
@@ -369,7 +377,7 @@ def _check_closing(item: WorkItem, url: str, history: History) -> None:
     if not unfinished:
         return
     moved = return_to_finalizing(item, url)
-    add_workitem_comment(url, unfinished_pr_comment(url, history.last_assigned_to, unfinished, moved))
+    add_workitem_comment(url, unfinished_pr_comment(url, addressee(history, CLOSED_COLUMN), unfinished, moved))
     log.warning("Карточка %s: pull request не завершены (%s), в карточку добавлен комментарий", item.id,
                 ", ".join(f"{pr.url} ({pr.status})" for pr in unfinished))
 

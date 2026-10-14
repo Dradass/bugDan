@@ -518,6 +518,12 @@ class History:
     text_edits: list[TextEdit]  # Дополнения текстовых полей карточки, от старых к новым
     last_assigned_to: dict | None  # Последний, кто был указан в Assigned To (сейчас поле может быть пустым)
     description_editor: dict | None = None  # Последний, кто изменял текстовые поля карточки (TEXT_FIELDS)
+    # Столбец доски (в нижнем регистре) -> последний, кто перенес в него карточку
+    column_movers: dict[str, dict] = field(default_factory=dict)
+
+    def moved_by(self, column: str) -> dict | None:
+        """Последний, кто перенес карточку в столбец column (без учета регистра); None, если в истории нет."""
+        return self.column_movers.get(column.lower())
 
 
 def _added_text(old_html: str, new_html: str) -> str:
@@ -542,10 +548,10 @@ def _get_updates(s: requests.Session, collection: str, item_id: int) -> list[dic
 
 
 def load_history(item: WorkItem) -> History:
-    """Комментарии карточки с авторами, дополнения ее текстовых полей (TEXT_FIELDS), последний ответственный
-    и последний, кто правил текстовые поля, по истории изменений."""
+    """Комментарии карточки с авторами, дополнения ее текстовых полей (TEXT_FIELDS), последний ответственный,
+    последний, кто правил текстовые поля, и кто последним переносил карточку в каждый столбец, по истории изменений."""
     s = _session()
-    edits, assigned, editor = [], None, None
+    edits, assigned, editor, movers = [], None, None, {}
     for update in _get_updates(s, item.collection, item.id):
         author = _identity_ref(update.get("revisedBy")) or {}
         fields = update.get("fields") or {}
@@ -558,8 +564,10 @@ def load_history(item: WorkItem) -> History:
         # Когда ответственного убирают, newValue пустое, а oldValue - тот, кто был указан последним.
         if isinstance(change := fields.get("System.AssignedTo"), dict):
             assigned = _identity_ref(change.get("newValue")) or _identity_ref(change.get("oldValue")) or assigned
+        if isinstance(change := fields.get("System.BoardColumn"), dict) and change.get("newValue") and author:
+            movers[str(change["newValue"]).lower()] = author
     return History(_comment_records(s, item.collection, item.project, item.id), edits, item.assigned_to or assigned,
-                   editor)
+                   editor, movers)
 
 
 @dataclass
