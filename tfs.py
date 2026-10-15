@@ -204,8 +204,10 @@ def create_pull_request(repo_url: str, source_branch: str, target_branch: str,
 
 
 def _identity_id(s: requests.Session, collection: str, person: dict) -> str:
-    """id пользователя TFS по IdentityRef из карточки."""
-    if person.get("id"):
+    """id пользователя в коллекции collection по IdentityRef из карточки."""
+    # id годится только в той коллекции, откуда пришел IdentityRef: у карточки на tech.directum.ru и pull request
+    # на rxtfs.directum.ru id одного и того же пользователя разные, поэтому для чужой коллекции ищем по uniqueName.
+    if person.get("id") and (person.get("url") or "").lower().startswith(collection.rstrip("/").lower() + "/"):
         return person["id"]
     # Старые версии TFS отдают в поле карточки только строку "Имя <DOMAIN\login>"
     r = s.get(f"{collection}/_apis/identities",
