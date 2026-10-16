@@ -48,10 +48,6 @@ RULES_BLOCK = """Правила написания кода, которые ну
 ---
 """
 
-ACCURACY_TASK = """4. Последней строкой ответа оцени, с какой точностью {what},
-   в формате "Точность: N% - обоснование", где N от 0 до 100, а обоснование - одно предложение
-   (насколько уверен в причине, проверено ли решение, что осталось непроверенным)."""
-
 # Без этого модель комментирует почти каждую измененную строку, даже самую простую
 COMMENTS_RULE = """Комментарии в коде добавляй только для сложной или неочевидной логики,
    простые изменения и простой код не комментируй."""
@@ -67,8 +63,7 @@ FIX_TASK = """Задача:
 соответствует замыслу или баг уже исправлен), не меняй файлы, а в ответе кратко объясни, почему исправление
 в коде не нужно и что можно сделать вместо него. Этот текст станет комментарием в карточке бага,
 поэтому пиши без markdown-разметки.
-""".format(comments=COMMENTS_RULE) + \
-    ACCURACY_TASK.format(what="ты устранил баг (или верно определил, что исправление в коде не требуется)")
+""".format(comments=COMMENTS_RULE)
 
 TASK_BLOCK = """Ты работаешь в репозитории {repo} (ветка {branch}).
 Описание work item:
@@ -88,8 +83,7 @@ WORK_TASK = """Задача:
 или окружением) или описания недостаточно, чтобы ее выполнить, не меняй файлы, а в ответе кратко объясни
 причину и что нужно сделать или уточнить. Этот текст станет комментарием в карточке,
 поэтому пиши без markdown-разметки.
-""".format(comments=COMMENTS_RULE) + \
-    ACCURACY_TASK.format(what="ты решил задачу (или верно определил, что изменения в коде не требуются)")
+""".format(comments=COMMENTS_RULE)
 
 
 def git(*args, cwd, input: str | None = None) -> str:
@@ -396,27 +390,6 @@ def move_card(bug_url: str, column: str, only_from: str | None = None) -> None:
         print(f"Внимание: не удалось перенести карточку в столбец {column}: {e}", file=sys.stderr)
 
 
-ACCURACY_RE = re.compile(r"^[^\w\n]*Точность[^\w\n]*(\d{1,3})\s*%[^\w\n]*(.*)$", re.IGNORECASE | re.MULTILINE)
-
-
-def split_accuracy(summary: str) -> tuple[str, str | None]:
-    """Отделяет от ответа Claude последнюю строку с оценкой точности. Возвращает (ответ без нее, "N% - обоснование")
-    или (ответ, None), если оценки нет."""
-    match = None
-    for match in ACCURACY_RE.finditer(summary):
-        pass
-    if match is None:
-        return summary, None
-    percent, reason = min(int(match[1]), 100), match[2].strip()
-    rest = (summary[:match.start()] + summary[match.end():]).strip()
-    return rest, f"{percent}%" + (f" - {reason}" if reason else "")
-
-
-def with_accuracy(comment: str, accuracy: str | None) -> str:
-    """HTML комментария в карточку с оценкой точности Claude после основного текста."""
-    return comment + (f"<br><b>Точность:</b> {html.escape(accuracy)}" if accuracy else "")
-
-
 def no_fix_comment(summary: str, caption: str = BUG_TEXTS.no_change) -> str:
     """HTML комментария в карточку, когда Claude не внес изменений: его объяснение, почему изменения в коде не нужны."""
     text = "<br>".join(html.escape(line) for line in summary.splitlines())
@@ -501,15 +474,14 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
     except BaseException:
         cleanup()
         raise
-    summary, accuracy = split_accuracy(res["result"].strip())
+    summary = res["result"].strip()
     print(summary)
-    print(f"Точность: {accuracy or 'Claude не указал'}", file=sys.stderr)
     print(f"\n---\n{usage_summary(res)}", file=sys.stderr)
 
     if not git("status", "--porcelain", cwd=worktree):
         cleanup()
         try:
-            comment.add(with_accuracy(no_fix_comment(summary, texts.no_change), accuracy))
+            comment.add(no_fix_comment(summary, texts.no_change))
             print(f"В карточку #{bug_id} добавлен комментарий о том, что изменения в коде не требуются.",
                   file=sys.stderr)
         except Exception as e:
@@ -553,7 +525,7 @@ def fix_in_new_branch(bug_url: str, repo_path: Path, repo_url: str, base: str, b
 
     link = html.escape(pr_url)
     try:
-        comment.add(with_accuracy(f'{texts.pr_link}: <a href="{link}">{link}</a>', accuracy))
+        comment.add(f'{texts.pr_link}: <a href="{link}">{link}</a>')
         print(f"В карточку #{bug_id} добавлен комментарий со ссылкой на pull request.", file=sys.stderr)
     except Exception as e:
         print(f"Внимание: {e}", file=sys.stderr)
