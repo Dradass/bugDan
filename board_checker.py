@@ -3,6 +3,7 @@
 import html
 import logging
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
@@ -115,12 +116,42 @@ log = logging.getLogger("bugdan")
 
 # Проверки обращаются к TFS и Claude, поэтому идут в фоне по одной, а сервер сразу отвечает TFS.
 _checks = ThreadPoolExecutor(max_workers=1, thread_name_prefix="board-check")
+Check = Callable[[WorkItem, str, History], object]  # Проверка карточки: check(item, url, history)
+# Проверки, которые ждут запуска: номер карточки -> (проверка, ссылка, столбец). У карточки ждет не больше одной
+# проверки: если карточку быстро двигают по доске, ждущая проверка заменяется проверкой для последнего переноса.
+_pending: dict[int, tuple[Check, str, str]] = {}
+_pending_lock = threading.Lock()
 
 
-def _run_check(check: Callable[[WorkItem, str, History], object], bug_id: int, url: str) -> None:
-    """Загружает карточку и ее историю и выполняет для них проверку check(item, url, history)."""
+def _submit_check(check: Check, bug_id: int, url: str, column: str, name: str) -> None:
+    """Ставит проверку check карточки, перенесенной в столбец column, в очередь; name - что проверяется, для лога.
+    Если проверка этой карточки уже ждет запуска, она заменяется новой."""
+    with _pending_lock:
+        replaced = bug_id in _pending
+        _pending[bug_id] = (check, url, column)
+    if replaced:
+        log.info("Карточка %s: %s заменила ждущую в очереди проверку этой карточки", bug_id, name)
+        return
+    log.info("Карточка %s: %s поставлена в очередь", bug_id, name)
+    _checks.submit(_run_pending, bug_id)
+
+
+def _run_pending(bug_id: int) -> None:
+    """Выполняет последнюю поставленную в очередь проверку карточки."""
+    with _pending_lock:
+        check, url, column = _pending.pop(bug_id)
+    _run_check(check, bug_id, url, column)
+
+
+def _run_check(check: Check, bug_id: int, url: str, column: str) -> None:
+    """Загружает карточку и ее историю и выполняет для них проверку check(item, url, history).
+    Если карточку уже унесли из столбца column, в который ее перенесли, проверка пропускается."""
     try:
         item = load_workitem(url, with_comments=False)
+        if item.board_column.strip().lower() != column.lower():
+            log.info("Карточка %s: проверка для столбца %s пропущена, карточка уже в столбце %s", bug_id, column,
+                     item.board_column or "-")
+            return
         check(item, url, load_history(item))
     except SystemExit as e:  # ask_claude сообщает об ошибке через sys.exit("текст")
         log.error("Карточка %s: ошибка проверки: %s", bug_id, e.code)
@@ -183,8 +214,7 @@ def check_bug_description(item: WorkItem, url: str, history: History) -> None:
 def check_ready_for_dev(bug_id: int, url: str) -> None:
     """Карточка перенесена в ReadyForDev: проверка, что по описанию бага его можно воспроизвести (оценивает Claude).
     Если нет, в карточку добавляется комментарий. Проверка идет в фоне."""
-    log.info("Карточка %s: проверка описания бага поставлена в очередь", bug_id)
-    _checks.submit(_run_check, check_bug_description, bug_id, url)
+    _submit_check(check_bug_description, bug_id, url, READY_FOR_DEV_COLUMN, "проверка описания бага")
 
 
 def links_in_comments(comments: list[tuple[dict, str]], pattern: re.Pattern) -> list[str]:
@@ -376,8 +406,8 @@ def check_decision(bug_id: int, url: str) -> None:
     (не отмененный) или коммит, связанные в секции Development или по ссылке из комментария, либо объяснение
     ответственного, почему баг не будет исправлен. Если ее нет, в карточку добавляется комментарий.
     Проверка идет в фоне."""
-    log.info("Карточка %s: проверка решения бага поставлена в очередь", bug_id)
-    _checks.submit(_run_check, partial(check_solve_evidence, column=READY_FOR_TESTING_COLUMN), bug_id, url)
+    _submit_check(partial(check_solve_evidence, column=READY_FOR_TESTING_COLUMN), bug_id, url,
+                  READY_FOR_TESTING_COLUMN, "проверка решения бага")
 
 
 def _check_closing(item: WorkItem, url: str, history: History) -> None:
@@ -397,8 +427,7 @@ def check_closing(bug_id: int, url: str) -> None:
     коммитом или ответственный объяснил, почему баг не будет исправлен. Если pull request не завершены или нет
     ни pull request, ни коммита, ни объяснения, карточка возвращается в Finalizing, а в нее добавляется комментарий.
     Проверка идет в фоне."""
-    log.info("Карточка %s: проверка закрытия бага поставлена в очередь", bug_id)
-    _checks.submit(_run_check, _check_closing, bug_id, url)
+    _submit_check(_check_closing, bug_id, url, CLOSED_COLUMN, "проверка закрытия бага")
 
 
 def check_board_column(bug_id: int, url: str, column: str, fix: Callable[[int, str], None]) -> bool:

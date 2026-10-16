@@ -385,6 +385,7 @@ class WorkItem:
     tags: list[str] = field(default_factory=list)  # System.Tags
     referenced: list[str] = field(default_factory=list)  # Ссылки на другие карточки из полей TEXT_FIELDS
     found_in_version: str = ""  # Found In Version (FOUND_IN_VERSION_FIELD): 26.3.0.0054
+    board_column: str = ""  # System.BoardColumn: столбец доски, в котором сейчас карточка
 
 
 # Ссылка на карточку: .../_workitems/edit/<номер> или ссылка на доску с ?workitem=<номер>
@@ -478,7 +479,8 @@ def load_workitem(url: str, with_comments: bool = True) -> WorkItem:
                     assigned_to=_identity_ref(fields.get("System.AssignedTo")),
                     tags=parse_tags(fields.get("System.Tags")),
                     referenced=_referenced_workitems([fields.get(name) or "" for name in TEXT_FIELDS], item_id),
-                    found_in_version=str(fields.get(FOUND_IN_VERSION_FIELD) or ""))
+                    found_in_version=str(fields.get(FOUND_IN_VERSION_FIELD) or ""),
+                    board_column=fields.get("System.BoardColumn") or "")
 
 
 def same_person(a: dict | None, b: dict | None) -> bool:
