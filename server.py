@@ -6,8 +6,9 @@
 Подписка в TFS: Project Settings -> Service hooks -> Web Hooks, событие "Work item updated",
 фильтры: тег AIFix, измененное поле Tags. Тег репозитория проверяет сервер.
 
-Endpoint /check-work-item принимает то же событие для измененного поля Board Column: для карточек с тегом AICheck
-выполняет проверку бага в зависимости от нового столбца (наличие информации о решении бага при переносе
+Endpoint /check-work-item принимает то же событие для измененного поля Board Column или Tags: для карточек с тегом
+AICheck, перенесенных в другой столбец или на которые только что поставили AICheck, выполняет проверку бага
+в зависимости от столбца карточки (наличие информации о решении бага при переносе
 в Ready for testing, завершенность pull request или другое подтверждение решения при переносе в Closed) или исправление при переносе в TODO
 (board_checker).
     python server.py [--config config.json]
@@ -140,18 +141,26 @@ def select_bug(event_properties: dict, repo_tags: set[str]) -> tuple[int | None,
 
 
 def select_column_move(event: dict) -> tuple[int | None, str, str, set[str]]:
-    """Возвращает (номер карточки, ссылка, новый столбец доски, теги карточки), если карточку с тегом AICheck
-    перенесли в другой столбец, иначе (None, причина пропуска, "", set())."""
+    """Возвращает (номер карточки, ссылка, столбец доски, теги карточки), если карточку с тегом AICheck
+    перенесли в другой столбец или на карточку поставили тег AICheck (тогда берется столбец, в котором она стоит),
+    иначе (None, причина пропуска, "", set())."""
     resource, reason = get_bug_resource(event, CHECK_TYPES)
     if reason:
         return None, reason, "", set()
-    change = (resource.get("fields") or {}).get("System.BoardColumn")
-    column = change.get("newValue") if isinstance(change, dict) else None
-    if not column:
-        return None, "столбец доски не менялся", "", set()
-    tags = parse_tags(((resource.get("revision") or {}).get("fields") or {}).get("System.Tags"))
+    fields = resource.get("fields") or {}
+    revision = (resource.get("revision") or {}).get("fields") or {}
+    tags = parse_tags(revision.get("System.Tags"))
     if CHECK_TAG.lower() not in tags:
         return None, f"нет тега {CHECK_TAG.lower()}", "", set()
+    change = fields.get("System.BoardColumn")
+    column = change.get("newValue") if isinstance(change, dict) else None
+    if not column:
+        changed_tags = get_changed_tags(fields)
+        if changed_tags is None or CHECK_TAG.lower() in changed_tags[0]:
+            return None, f"столбец доски не менялся, тег {CHECK_TAG.lower()} не ставился", "", set()
+        column = revision.get("System.BoardColumn")
+        if not column:
+            return None, f"тег {CHECK_TAG.lower()} поставлен, но карточка не на доске", "", set()
     bug_id, detail = get_bug_id_by_url(resource)
     return bug_id, detail, column, tags
 
