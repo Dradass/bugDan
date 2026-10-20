@@ -11,6 +11,9 @@ AICheck, перенесенных в другой столбец или на к�
 в зависимости от столбца карточки (наличие информации о решении бага при переносе
 в Ready for testing, завершенность pull request или другое подтверждение решения при переносе в Closed) или исправление при переносе в TODO
 (board_checker).
+Если на карточке бага стоит тег AIBackport и ее переносят в столбец Finalizing (или ставят тег на карточку
+в Finalizing), изменения ее pull request или коммита переносятся в ветки версий из "backport_branches"
+репозитория в config.json (backport).
     python server.py [--config config.json]
 """
 import argparse, base64, hmac, html, json, logging, os, queue, re, threading, traceback
@@ -21,9 +24,11 @@ from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from board_checker import CHECK_TAG, WARNING_TAG, check_board_column
+import backport
+from backport import BACKPORT_TAG
+from board_checker import CHECK_TAG, FINALIZING_COLUMN, WARNING_TAG, check_board_column
 import bug_fixer
-from bug_fixer import FIX_TAG, CardComment, FixSkipped, claude_version, find_claude, fix_bug, use_models
+from bug_fixer import FIX_TAG, REPO_LOCK, CardComment, FixSkipped, claude_version, find_claude, fix_bug, use_models
 from tfs import allow_hosts, host_allowed, set_workitem_tag
 
 HERE = Path(__file__).resolve().parent
@@ -140,9 +145,9 @@ def select_bug(event_properties: dict, repo_tags: set[str]) -> tuple[int | None,
     return bug_id, error_text, tags if bug_id is not None else []
 
 
-def select_column_move(event: dict) -> tuple[int | None, str, str, set[str]]:
-    """Возвращает (номер карточки, ссылка, столбец доски, теги карточки), если карточку с тегом AICheck
-    перенесли в другой столбец или на карточку поставили тег AICheck (тогда берется столбец, в котором она стоит),
+def select_column_move(event: dict, tag: str = CHECK_TAG) -> tuple[int | None, str, str, set[str]]:
+    """Возвращает (номер карточки, ссылка, столбец доски, теги карточки), если карточку с тегом tag (AICheck)
+    перенесли в другой столбец или на карточку поставили тег tag (тогда берется столбец, в котором она стоит),
     иначе (None, причина пропуска, "", set())."""
     resource, reason = get_bug_resource(event, CHECK_TYPES)
     if reason:
@@ -150,17 +155,18 @@ def select_column_move(event: dict) -> tuple[int | None, str, str, set[str]]:
     fields = resource.get("fields") or {}
     revision = (resource.get("revision") or {}).get("fields") or {}
     tags = parse_tags(revision.get("System.Tags"))
-    if CHECK_TAG.lower() not in tags:
-        return None, f"нет тега {CHECK_TAG.lower()}", "", set()
+    tag = tag.lower()
+    if tag not in tags:
+        return None, f"нет тега {tag}", "", set()
     change = fields.get("System.BoardColumn")
     column = change.get("newValue") if isinstance(change, dict) else None
     if not column:
         changed_tags = get_changed_tags(fields)
-        if changed_tags is None or CHECK_TAG.lower() in changed_tags[0]:
-            return None, f"столбец доски не менялся, тег {CHECK_TAG.lower()} не ставился", "", set()
+        if changed_tags is None or tag in changed_tags[0]:
+            return None, f"столбец доски не менялся, тег {tag} не ставился", "", set()
         column = revision.get("System.BoardColumn")
         if not column:
-            return None, f"тег {CHECK_TAG.lower()} поставлен, но карточка не на доске", "", set()
+            return None, f"тег {tag} поставлен, но карточка не на доске", "", set()
     bug_id, detail = get_bug_id_by_url(resource)
     return bug_id, detail, column, tags
 
@@ -242,11 +248,13 @@ class Repo(NamedTuple):
     path: Path  # Путь до репозитория решения
     rule: Path | None  # Файл с правилом написания кода для Claude; None - без правила
     default_branch: str | None  # Базовая ветка, если в карточке и ее родителе ветка не найдена; None - не задана
+    backport_branches: tuple[str, ...] = ()  # Ветки версий для бэкпорта по тегу AIBackport
 
 
 def read_repos(path: Path) -> dict[str, Repo]:
     """Репозитории по тегам (в нижнем регистре) из секции "tags" конфига:
-    {"<тег>": {"repo": "<путь>", "rule": "<файл правила, необязательно>", "default_branch": "<ветка, необязательно>"}}.
+    {"<тег>": {"repo": "<путь>", "rule": "<файл правила, необязательно>", "default_branch": "<ветка, необязательно>",
+    "backport_branches": ["<ветка версии>", ...] - необязательно}}.
     Относительный путь до файла правила считается от папки конфига. Если ветка не задана - None."""
     try:
         tags = json.loads(path.read_text(encoding="utf-8-sig"))["tags"]
@@ -257,7 +265,8 @@ def read_repos(path: Path) -> dict[str, Repo]:
     repos = {}
     for tag, item in tags.items():
         key = tag.strip().lower()
-        if (not key or ";" in key or key in {TRIGGER_TAG.lower(), CHECK_TAG.lower(), WARNING_TAG.lower()}
+        if (not key or ";" in key
+                or key in {TRIGGER_TAG.lower(), CHECK_TAG.lower(), WARNING_TAG.lower(), BACKPORT_TAG.lower()}
                 or key in repos):
             raise SystemExit(f"В {path} недопустимый или повторяющийся тег {tag!r}")
         if not isinstance(item, dict):
@@ -276,7 +285,12 @@ def read_repos(path: Path) -> dict[str, Repo]:
             if not isinstance(branch, str) or not branch.strip():
                 raise SystemExit(f'В {path} для тега {tag!r} в "default_branch" должно быть имя ветки')
             branch = branch.strip().removeprefix("refs/heads/")
-        repos[key] = Repo(Path(repo), rule, branch)
+        backport_branches = item.get("backport_branches") or []
+        if not isinstance(backport_branches, list) or not all(isinstance(b, str) and b.strip()
+                                                              for b in backport_branches):
+            raise SystemExit(f'В {path} для тега {tag!r} в "backport_branches" должен быть список имен веток')
+        backport_branches = tuple(dict.fromkeys(b.strip().removeprefix("refs/heads/") for b in backport_branches))
+        repos[key] = Repo(Path(repo), rule, branch, backport_branches)
     return repos
 
 
@@ -363,7 +377,8 @@ class Runner:
             try:
                 # Файл правила читается при каждом запуске, чтобы его правки применялись без перезапуска сервера.
                 rules = read_rule(repo.rule) if repo.rule else None
-                fix_bug(url, str(repo.path), allow_duplicate, rules, repo.default_branch, require_branch, comment)
+                with REPO_LOCK:
+                    fix_bug(url, str(repo.path), allow_duplicate, rules, repo.default_branch, require_branch, comment)
                 error = skipped = None
             except FixSkipped as e:
                 error, skipped = None, str(e)
@@ -443,9 +458,13 @@ class HookHandler(BaseHTTPRequestHandler):
         self.reply(202, {"status": "queued", "bug": bug_id, "tags": queued, DUPLICATE_PARAM: allow_duplicate})
 
     def check_work_item(self, event: dict):
-        """Событие service hook TFS о переносе карточки по доске: проверка бага или исправление (board_checker)."""
+        """Событие service hook TFS о переносе карточки по доске: проверка бага или исправление (board_checker),
+        а для карточки с тегом AIBackport в столбце Finalizing - бэкпорт (backport)."""
+        backport_id = self.queue_backport(event)
         bug_id, detail, column, card_tags = select_column_move(event)
         if bug_id is None:
+            if backport_id is not None:
+                return self.reply(200, {"status": "processed", "bug": backport_id, "backport": True})
             log.debug("Событие пропущено: %s", detail)
             return self.reply(200, {"status": "ignored", "reason": detail})
         allow_duplicate = self.query_flag(DUPLICATE_PARAM)
@@ -460,10 +479,22 @@ class HookHandler(BaseHTTPRequestHandler):
             # Без ветки в карточке исправление по AICheck не запускается, ветка по умолчанию не берется.
             self.queue_fix(bug_id, url, tags, allow_duplicate, require_branch=True)
 
-        if not check_board_column(bug_id, detail, column, fix):
+        if not check_board_column(bug_id, detail, column, fix) and backport_id is None:
             log.debug("Карточка %s перенесена в столбец %s, для него действий нет", bug_id, column)
             return self.reply(200, {"status": "ignored", "reason": f"столбец {column!r} не обрабатывается"})
-        self.reply(200, {"status": "processed", "bug": bug_id, "column": column})
+        self.reply(200, {"status": "processed", "bug": bug_id, "column": column, "backport": backport_id is not None})
+
+    def queue_backport(self, event: dict) -> int | None:
+        """Ставит в очередь бэкпорт, если карточку с тегом AIBackport перенесли в Finalizing или поставили тег
+        на карточку в Finalizing; возвращает номер карточки или None, если бэкпорт не нужен."""
+        bug_id, detail, column, _ = select_column_move(event, BACKPORT_TAG)
+        if bug_id is None or column.strip().lower() != FINALIZING_COLUMN.lower():
+            return None
+        if backport.submit(bug_id, detail, self.server.runner.repos):
+            log.info("Карточка %s: бэкпорт поставлен в очередь", bug_id)
+        else:
+            log.info("Карточка %s: бэкпорт уже в очереди, повтор события пропущен", bug_id)
+        return bug_id
 
     def queue_fix(self, bug_id: int, url: str, tags: list[str], allow_duplicate: bool,
                   require_branch: bool = False, by_fix_tag: bool = False) -> list[str]:
@@ -553,7 +584,8 @@ def main():
     server = HookServer((HOST, PORT), cfg, Runner(repos, FIX_LOG_DIR))
     log.info("Жду события на http://%s:%s%s и %s, теги %s, %s и теги репозиториев: %s", HOST, PORT, HOOK_PATH,
              CHECK_PATH, TRIGGER_TAG, CHECK_TAG,
-             "; ".join(f"{t} -> {r.path} (правило Claude {r.rule or 'не задано'}, ветка по умолчанию {r.default_branch or 'не задана'})"
+             "; ".join(f"{t} -> {r.path} (правило Claude {r.rule or 'не задано'}, ветка по умолчанию {r.default_branch or 'не задана'}, "
+                       f"ветки бэкпорта {', '.join(r.backport_branches) or 'не заданы'})"
                        for t, r in repos.items()))
     log.info("Хосты TFS, на которые разрешены запросы: %s", ", ".join(tfs_hosts))
     try:

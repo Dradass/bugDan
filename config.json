@@ -4,7 +4,8 @@
     "Applied": {
       "repo": "D:\\Projects\\master\\RX",
 	  "rule": "D:\\Projects\\master\\RX\\src\\.cursor\\rules\\applied-rules.mdc",
-      "default_branch": "master"
+      "default_branch": "master",
+      "backport_branches": ["26.3", "26.2"]
     },
     "SmartInstruments": {
       "repo": "D:\\Projects\\master\\SmartInstruments"

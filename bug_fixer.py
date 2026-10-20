@@ -1,4 +1,4 @@
-import html, json, os, re, shutil, subprocess, sys
+import html, json, os, re, shutil, subprocess, sys, threading
 from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple
@@ -25,6 +25,8 @@ _model_env: dict[str, str] = {}  # Окружение claude для своего
 # Уровень рассуждений для своей модели: Claude Code по умолчанию передает high, а сервер модели
 # принимает только xhigh, medium и low (через LiteLLM - reasoning_effort)
 LOCAL_MODEL_EFFORT = "medium"
+# Работа с git в репозиториях решений идет по одной за раз: параллельные git fetch в одном репозитории мешают друг другу
+REPO_LOCK = threading.Lock()
 
 BUG_BLOCK = """Ты работаешь в репозитории {repo} (ветка {branch}).
 Описание бага:

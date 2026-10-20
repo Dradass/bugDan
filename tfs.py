@@ -517,6 +517,14 @@ def linked_commits(relations: list[dict]) -> list[str]:
 class PullRequest:
     url: str  # Ссылка на pull request в веб-интерфейсе
     status: str  # Состояние в TFS: active, abandoned или completed
+    title: str = ""
+    target_branch: str = ""  # Ветка, в которую сливается pull request: master
+    source_branch: str = ""  # Ветка с изменениями: vega/1234567-bug-fix
+    created_by: dict | None = None  # IdentityRef автора pull request
+    repo_id: str = ""  # id репозитория pull request
+    merge_source_commit: str = ""  # Последний коммит ветки с изменениями, учтенный при слиянии
+    merge_target_commit: str = ""  # Коммит целевой ветки, с которым выполнялось слияние
+    merge_commit: str = ""  # Коммит слияния (для завершенного - коммит в целевой ветке)
 
 
 def get_pull_request(link: str, collection: str) -> PullRequest:
@@ -539,7 +547,53 @@ def get_pull_request(link: str, collection: str) -> PullRequest:
     project_name = (repository.get("project") or {}).get("name") or unquote(project)
     url = (f"{collection}/{quote(project_name)}/_git/{quote(repository.get('name') or unquote(repo))}"
            f"/pullrequest/{data.get('pullRequestId', pr_id)}")
-    return PullRequest(url, str(data.get("status", "")).lower())
+    commit = lambda name: (data.get(name) or {}).get("commitId") or ""
+    return PullRequest(url, str(data.get("status", "")).lower(), data.get("title") or "",
+                       (data.get("targetRefName") or "").removeprefix("refs/heads/"),
+                       (data.get("sourceRefName") or "").removeprefix("refs/heads/"),
+                       _identity_ref(data.get("createdBy")), repository.get("id") or "",
+                       commit("lastMergeSourceCommit"), commit("lastMergeTargetCommit"), commit("lastMergeCommit"))
+
+
+def repository_id(repo_url: str) -> str:
+    """id git-репозитория по ссылке вида .../<Коллекция>/<Проект>/_git/<Репозиторий>."""
+    collection, project, repo = parse_git_url(repo_url)
+    r = _session().get(f"{collection}/{project}/_apis/git/repositories/{repo}", params={"api-version": API_VERSION})
+    if not r.ok:
+        raise RuntimeError(f"Не удалось получить репозиторий {repo_url}: HTTP {r.status_code} {r.text[:500]}")
+    return r.json()["id"]
+
+
+@dataclass
+class Commit:
+    url: str  # Ссылка на коммит в веб-интерфейсе
+    sha: str
+    repo_id: str  # id репозитория коммита
+    author: dict  # Автор: {"displayName": имя, "uniqueName": почта}
+    message: str = ""
+
+
+def get_commit(link: str, collection: str) -> Commit:
+    """Коммит по связи из секции Development (vstfs:///Git/Commit/..., collection - коллекция карточки)
+    или по ссылке вида .../<проект>/_git/<репозиторий или его id>/commit/<sha>."""
+    if link.lower().startswith(COMMIT_ARTIFACT_PREFIX):
+        _, repo_id, sha = unquote(link[len(COMMIT_ARTIFACT_PREFIX):]).split("/")
+        api = f"{collection}/_apis/git/repositories/{repo_id}"
+    else:
+        m = re.match(r"(.+?/_git/[^/?#]+)/commit/([0-9a-f]{7,40})", link, re.IGNORECASE)
+        if m is None:
+            raise ValueError(f"Не удалось разобрать ссылку на коммит: {link}")
+        repo_id, sha = repository_id(m[1]), m[2]
+        collection = parse_git_url(m[1])[0]
+        api = f"{collection}/_apis/git/repositories/{repo_id}"
+    r = _session().get(f"{api}/commits/{sha}", params={"api-version": API_VERSION})
+    if not r.ok:
+        raise RuntimeError(f"Не удалось получить коммит {link}: HTTP {r.status_code} {r.text[:500]}")
+    data = r.json()
+    author = data.get("author") or {}
+    return Commit(data.get("remoteUrl") or link, data.get("commitId") or sha, repo_id,
+                  {"displayName": author.get("name") or "?", "uniqueName": author.get("email") or ""},
+                  data.get("comment") or "")
 
 
 @dataclass
@@ -720,10 +774,7 @@ def find_base_branch(item: WorkItem, repo_url: str, exists) -> tuple[str, str] |
     """
     # Репозиторий и карточки могут быть на разных серверах, а HttpNegotiateAuth запоминает хост
     # первого запроса - поэтому для каждого сервера своя сессия.
-    collection, project, repo = parse_git_url(repo_url)
-    r = _session().get(f"{collection}/{project}/_apis/git/repositories/{repo}", params={"api-version": API_VERSION})
-    r.raise_for_status()
-    repo_id = r.json()["id"]
+    repo_id = repository_id(repo_url)
 
     parent = _find_parent(_session(), item)
     for card in [item] + ([parent] if parent else []):
