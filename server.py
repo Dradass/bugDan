@@ -43,7 +43,7 @@ LOG_DIR = HERE / "logs"
 FIX_LOG_DIR = LOG_DIR / "fix_logs"  # Логи исправлений, по файлу на запуск
 SERVER_LOG_DIR = LOG_DIR / "server"  # Общий лог сервера, по файлу на день
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"  # Дата и время в начале каждой строки логов
-MAX_BODY = 5 * 1024 * 1024
+MAX_ATTACHMENT_BODY_SIZE = 5 * 1024 * 1024
 GUID_RE = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
 DUPLICATE_PARAM ="allow-duplicate"  # ?allow-duplicate=1 в URL: создать новую ветку, даже если ветка бага уже есть
 
@@ -65,27 +65,28 @@ def get_changed_tags(fields: dict) -> tuple[set[str], set[str]] | None:
     return parse_tags(change.get("oldValue")), parse_tags(change.get("newValue"))
 
 
-def get_triggered_tags(fields: dict, repo_tags: set[str]) -> tuple[list[str], str | None]:
+def get_triggered_tags(fields: dict, repos_tags: set[str]) -> tuple[list[str], str | None]:
     """Теги репозиториев, по которым нужно запустить исправление, и причина пропуска, если таких нет.
     Запуск по тегу репозитория - когда в этом изменении на карточке впервые оказались он и AIFix
     (неважно, какой из них поставлен последним)."""
     changed_tags = get_changed_tags(fields)
     if changed_tags is None:
         return [], "теги не менялись"
-    old_tag, new_tag = changed_tags
+    old_tags, new_tags = changed_tags
     trigger_tag = TRIGGER_TAG.lower()
-    if trigger_tag not in new_tag:
+    if trigger_tag not in new_tags:
         return [], f"нет тега {trigger_tag}"
-    matched_tags = sorted(repo_tags & new_tag)
+    matched_tags = sorted(repos_tags & new_tags)
     if not matched_tags:
-        return [], "нет ни одного из тегов " + ", ".join(sorted(repo_tags))
-    tags = [t for t in matched_tags if not {trigger_tag, t} <= old_tag]
+        return [], "нет ни одного из тегов " + ", ".join(sorted(repos_tags))
+    # Проверить, что среди новых тегов, отличных от старых, есть тот, на который должно запускаться исправление бага.
+    tags = [t for t in matched_tags if not {trigger_tag, t} <= old_tags]
     if not tags:
         return [], f"теги {trigger_tag}, " + ", ".join(matched_tags) + " стояли и до изменения"
     return tags, None
 
 
-def bug_url(resource: dict) -> str:
+def get_bug_url(resource: dict) -> str:
     """Ссылка на карточку вида <коллекция>/<проект>/_workitems/edit/<id>, которую понимает bug_fixer."""
     # resource.url: <коллекция>/_apis/wit/workItems/<id>/updates/<n>, но TFS может добавить
     # к коллекции id или имя проекта: <коллекция>/<проект>/_apis/...
@@ -97,7 +98,7 @@ def bug_url(resource: dict) -> str:
     return f"{collection}/{quote(project)}/_workitems/edit/{resource['workItemId']}"
 
 
-def item_type(resource: dict) -> str:
+def get_item_type(resource: dict) -> str:
     """Тип карточки (System.WorkItemType) из resource события."""
     return ((resource.get("revision") or {}).get("fields") or {}).get("System.WorkItemType", "")
 
@@ -108,50 +109,52 @@ def get_bug_resource(event_properties: dict, types: set[str] | None = None) -> t
     if event_properties.get("eventType") != "workitem.updated":
         return {}, f"событие {event_properties.get('eventType')!r} не обрабатывается"
     resource = event_properties.get("resource") or {}
-    if types is not None and item_type(resource).lower() not in types:
-        return {}, f"тип карточки {item_type(resource)!r} не обрабатывается"
+    if types is not None and get_item_type(resource).lower() not in types:
+        return {}, f"тип карточки {get_item_type(resource)!r} не обрабатывается"
     return resource, None
 
 
-def get_bug_id_by_url(resource: dict) -> tuple[int | None, str]:
-    """(номер карточки, ссылка) или (None, причина пропуска), если в событии нет данных карточки."""
+def get_bug_id_by_url(resource: dict) -> tuple[int | None, str, str | None]:
+    """(номер карточки, ссылка, None) или (None, "", причина пропуска), если в событии нет данных карточки."""
     try:
-        bug_id, url = int(resource["workItemId"]), bug_url(resource)
+        bug_id, url = int(resource["workItemId"]), get_bug_url(resource)
     except (KeyError, TypeError, ValueError) as e:
-        return None, f"в событии нет данных карточки: {e!r}"
+        return None, "", f"в событии нет данных карточки: {e!r}"
     if not host_allowed(url):
         log.warning("Карточка %s: событие со ссылкой на хост вне tfs_hosts пропущено: %s", bug_id, url)
-        return None, "хост карточки не входит в tfs_hosts"
-    return bug_id, url
+        return None, "", "хост карточки не входит в tfs_hosts"
+    return bug_id, url, None
 
 
-def select_bug(event_properties: dict, repo_tags: set[str]) -> tuple[int | None, str, list[str]]:
+def select_bug(event_properties: dict, repos_tags: set[str]) -> tuple[int | None, str, list[str]]:
     """Возвращает (номер карточки, ссылка, теги репозиториев), если событие должно запустить исправление,
     иначе (None, причина пропуска, [])."""
-    resource, reason = get_bug_resource(event_properties)
-    if reason:
-        return None, reason, []
-    tags, reason = get_triggered_tags(resource.get("fields") or {}, repo_tags)
-    if reason:
-        return None, reason, []
+    resource, error_text = get_bug_resource(event_properties)
+    if error_text:
+        return None, error_text, []
+    tags, error_text = get_triggered_tags(resource.get("fields") or {}, repos_tags)
+    if error_text:
+        return None, error_text, []
     # Тип проверяется после тегов, чтобы предупреждать только о карточках, на которые действительно поставили AIFix.
-    kind = item_type(resource)
-    if kind.lower() not in FIX_TYPES:
-        reason = f"неподдерживаемый тип Work Item {kind!r}"
+    item_type = get_item_type(resource)
+    if item_type.lower() not in FIX_TYPES:
+        error_text = f"неподдерживаемый тип Work Item {item_type!r}"
         log.warning("Карточка %s: тег %s поставлен на %s, обрабатываются только: %s", resource.get("workItemId"),
-                    TRIGGER_TAG, reason, ", ".join(sorted(FIX_TYPES)))
-        return None, reason, []
-    bug_id, error_text = get_bug_id_by_url(resource)
-    return bug_id, error_text, tags if bug_id is not None else []
+                    TRIGGER_TAG, error_text, ", ".join(sorted(FIX_TYPES)))
+        return None, error_text, []
+    bug_id, url, error_text = get_bug_id_by_url(resource)
+    if error_text:
+        return None, error_text, []
+    return bug_id, url, tags
 
 
 def select_column_move(event: dict, tag: str = CHECK_TAG) -> tuple[int | None, str, str, set[str]]:
     """Возвращает (номер карточки, ссылка, столбец доски, теги карточки), если карточку с тегом tag (AICheck)
     перенесли в другой столбец или на карточку поставили тег tag (тогда берется столбец, в котором она стоит),
     иначе (None, причина пропуска, "", set())."""
-    resource, reason = get_bug_resource(event, CHECK_TYPES)
-    if reason:
-        return None, reason, "", set()
+    resource, error_text = get_bug_resource(event, CHECK_TYPES)
+    if error_text:
+        return None, error_text, "", set()
     fields = resource.get("fields") or {}
     revision = (resource.get("revision") or {}).get("fields") or {}
     tags = parse_tags(revision.get("System.Tags"))
@@ -167,8 +170,10 @@ def select_column_move(event: dict, tag: str = CHECK_TAG) -> tuple[int | None, s
         column = revision.get("System.BoardColumn")
         if not column:
             return None, f"тег {tag} поставлен, но карточка не на доске", "", set()
-    bug_id, detail = get_bug_id_by_url(resource)
-    return bug_id, detail, column, tags
+    bug_id, url, error_text = get_bug_id_by_url(resource)
+    if error_text:
+        return None, error_text, "", set()
+    return bug_id, url, column, tags
 
 
 def read_rule(path: Path) -> str:
@@ -247,6 +252,7 @@ class TimestampWriter:
 class Repo(NamedTuple):
     path: Path  # Путь до репозитория решения
     rule: Path | None  # Файл с правилом написания кода для Claude; None - без правила
+    rule_text: str | None  # Текст правила, прочитанный при запуске сервера; None - без правила
     default_branch: str | None  # Базовая ветка, если в карточке и ее родителе ветка не найдена; None - не задана
     backport_branches: tuple[str, ...] = ()  # Ветки версий для бэкпорта по тегу AIBackport
 
@@ -275,11 +281,12 @@ def read_repos(path: Path) -> dict[str, Repo]:
         if not isinstance(repo, str) or not Path(repo).is_dir():
             raise SystemExit(f'В {path} для тега {tag!r} в "repo" указан несуществующий путь {repo!r}')
         rule = item.get("rule") or None
+        rule_text = None
         if rule is not None:
             if not isinstance(rule, str):
                 raise SystemExit(f'В {path} для тега {tag!r} в "rule" должен быть путь до файла')
             rule = (path.parent / rule).resolve()
-            read_rule(rule)  # Ошибка в пути видна сразу при запуске, а не при первом баге
+            rule_text = read_rule(rule)
         branch = item.get("default_branch") or None
         if branch is not None:
             if not isinstance(branch, str) or not branch.strip():
@@ -290,7 +297,7 @@ def read_repos(path: Path) -> dict[str, Repo]:
                                                               for b in backport_branches):
             raise SystemExit(f'В {path} для тега {tag!r} в "backport_branches" должен быть список имен веток')
         backport_branches = tuple(dict.fromkeys(b.strip().removeprefix("refs/heads/") for b in backport_branches))
-        repos[key] = Repo(Path(repo), rule, branch, backport_branches)
+        repos[key] = Repo(Path(repo), rule, rule_text, branch, backport_branches)
     return repos
 
 
@@ -375,10 +382,9 @@ class Runner:
                 except Exception as e:
                     print(f"Внимание: {e}")
             try:
-                # Файл правила читается при каждом запуске, чтобы его правки применялись без перезапуска сервера.
-                rules = read_rule(repo.rule) if repo.rule else None
                 with REPO_LOCK:
-                    fix_bug(url, str(repo.path), allow_duplicate, rules, repo.default_branch, require_branch, comment)
+                    fix_bug(url, str(repo.path), allow_duplicate, repo.rule_text, repo.default_branch, require_branch,
+                            comment)
                 error = skipped = None
             except FixSkipped as e:
                 error, skipped = None, str(e)
@@ -425,7 +431,7 @@ class HookHandler(BaseHTTPRequestHandler):
         if not self.authorized():
             return self.reply(401, {"error": "unauthorized"}, {"WWW-Authenticate": 'Basic realm="bugDan"'})
         length = int(self.headers.get("Content-Length") or 0)
-        if length > MAX_BODY:
+        if length > MAX_ATTACHMENT_BODY_SIZE:
             return self.reply(413, {"error": "payload too large"})
         try:
             # Словарь с данными от хука TFS. Парсится строка вида: '"eventType": "workitem.updated", "resource": {"workItemId": 12345, ...}'
