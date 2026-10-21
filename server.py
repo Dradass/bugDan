@@ -114,6 +114,11 @@ def get_bug_resource(event_properties: dict, types: set[str] | None = None) -> t
     return resource, None
 
 
+def get_event_item_id(event_properties: dict):
+    """Номер карточки из события для логов; None, если его в событии нет."""
+    return (event_properties.get("resource") or {}).get("workItemId")
+
+
 def get_bug_id_by_url(resource: dict) -> tuple[int | None, str, str | None]:
     """(номер карточки, ссылка, None) или (None, "", причина пропуска), если в событии нет данных карточки."""
     try:
@@ -454,7 +459,7 @@ class HookHandler(BaseHTTPRequestHandler):
         """Событие service hook TFS: ставит карточку в очередь на исправление."""
         bug_id, error_text, tags = select_bug(event_properties, set(self.server.runner.repos))
         if bug_id is None:
-            log.debug("Событие пропущено: %s", error_text)
+            log.debug("Карточка %s: событие пропущено: %s", get_event_item_id(event_properties), error_text)
             return self.reply(200, {"status": "ignored", "reason": error_text})
         allow_duplicate = self.query_flag(DUPLICATE_PARAM)
         queued = self.queue_fix(bug_id, error_text, tags, allow_duplicate, by_fix_tag=True)
@@ -471,7 +476,7 @@ class HookHandler(BaseHTTPRequestHandler):
         if bug_id is None:
             if backport_id is not None:
                 return self.reply(200, {"status": "processed", "bug": backport_id, "backport": True})
-            log.debug("Событие пропущено: %s", detail)
+            log.debug("Карточка %s: событие пропущено: %s", get_event_item_id(event), detail)
             return self.reply(200, {"status": "ignored", "reason": detail})
         allow_duplicate = self.query_flag(DUPLICATE_PARAM)
         repo_tags = set(self.server.runner.repos)
