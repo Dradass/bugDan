@@ -6,8 +6,9 @@
 Подписка в TFS: Project Settings -> Service hooks -> Web Hooks, событие "Work item updated",
 фильтры: тег AIFix, измененное поле Tags. Тег репозитория проверяет сервер.
 
-Endpoint /check-work-item принимает то же событие для измененного поля Board Column или Tags: для карточек с тегом
-AICheck, перенесенных в другой столбец или на которые только что поставили AICheck, выполняет проверку бага
+Endpoint /check-work-item принимает то же событие для измененного поля Board Column или Tags: для карточек бага
+(с тегом AICheck, если задан board_checker.CHECK_TAG), перенесенных в другой столбец или на которые только что поставили AICheck,
+выполняет проверку бага
 в зависимости от столбца карточки (наличие информации о решении бага при переносе
 в Ready for testing, завершенность pull request или другое подтверждение решения при переносе в Closed) или исправление при переносе в TODO
 (board_checker).
@@ -26,7 +27,8 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import backport
 from backport import BACKPORT_TAG
-from board_checker import CHECK_TAG, FINALIZING_COLUMN, WARNING_TAG, check_board_column
+import board_checker
+from board_checker import FINALIZING_COLUMN, WARNING_TAG, check_board_column
 import bug_fixer
 from bug_fixer import FIX_TAG, REPO_LOCK, CardComment, FixSkipped, claude_version, find_claude, fix_bug, use_models
 from tfs import allow_hosts, host_allowed, set_workitem_tag
@@ -37,6 +39,7 @@ HOOK_PATH = "/propose-fix"  # Путь, на который TFS отправля
 CHECK_PATH = "/check-work-item"  # Путь, на который TFS отправляет события переноса карточки по доске
 FIX_TYPES = {"bug", "user story", "task"}  # Типы карточек, которые исправляются по тегу AIFix
 CHECK_TYPES = {"bug"}  # Типы карточек, которые проверяются при переносе по доске (тег AICheck)
+CHECK_TAG = getattr(board_checker, "CHECK_TAG", None)  # Пустой или не задан - проверяются все баги
 TRIGGER_TAG = FIX_TAG  # Тег, по которому срабатывает подписка TFS (AIFix)
 DEFAULT_CONFIG = HERE / "config.json"  # Конфиг с тегами репозиториев (--config)
 LOG_DIR = HERE / "logs"
@@ -153,22 +156,24 @@ def select_bug(event_properties: dict, repos_tags: set[str]) -> tuple[int | None
     return bug_id, url, tags
 
 
-def select_column_move(event: dict, tag: str = CHECK_TAG) -> tuple[int | None, str, str, set[str]]:
+def select_column_move(event: dict, tag: str | None = CHECK_TAG) -> tuple[int | None, str, str, set[str]]:
     """Возвращает (номер карточки, ссылка, столбец доски, теги карточки), если карточку с тегом tag (AICheck)
     перенесли в другой столбец или на карточку поставили тег tag (тогда берется столбец, в котором она стоит),
-    иначе (None, причина пропуска, "", set())."""
+    иначе (None, причина пропуска, "", set()). Пустой tag - тег не нужен, срабатывает только перенос."""
     resource, error_text = get_bug_resource(event, CHECK_TYPES)
     if error_text:
         return None, error_text, "", set()
     fields = resource.get("fields") or {}
     revision = (resource.get("revision") or {}).get("fields") or {}
     tags = parse_tags(revision.get("System.Tags"))
-    tag = tag.lower()
-    if tag not in tags:
+    tag = (tag or "").lower()
+    if tag and tag not in tags:
         return None, f"нет тега {tag}", "", set()
     change = fields.get("System.BoardColumn")
     column = change.get("newValue") if isinstance(change, dict) else None
     if not column:
+        if not tag:
+            return None, "столбец доски не менялся", "", set()
         changed_tags = get_changed_tags(fields)
         if changed_tags is None or tag in changed_tags[0]:
             return None, f"столбец доски не менялся, тег {tag} не ставился", "", set()
@@ -277,7 +282,7 @@ def read_repos(path: Path) -> dict[str, Repo]:
     for tag, item in tags.items():
         key = tag.strip().lower()
         if (not key or ";" in key
-                or key in {TRIGGER_TAG.lower(), CHECK_TAG.lower(), WARNING_TAG.lower(), BACKPORT_TAG.lower()}
+                or key in {t.lower() for t in (TRIGGER_TAG, CHECK_TAG, WARNING_TAG, BACKPORT_TAG) if t}
                 or key in repos):
             raise SystemExit(f"В {path} недопустимый или повторяющийся тег {tag!r}")
         if not isinstance(item, dict):
@@ -594,7 +599,7 @@ def main():
 
     server = HookServer((HOST, PORT), cfg, Runner(repos, FIX_LOG_DIR))
     log.info("Жду события на http://%s:%s%s и %s, теги %s, %s и теги репозиториев: %s", HOST, PORT, HOOK_PATH,
-             CHECK_PATH, TRIGGER_TAG, CHECK_TAG,
+             CHECK_PATH, TRIGGER_TAG, CHECK_TAG or "проверка всех багов без тега",
              "; ".join(f"{t} -> {r.path} (правило Claude {r.rule or 'не задано'}, ветка по умолчанию {r.default_branch or 'не задана'}, "
                        f"ветки бэкпорта {', '.join(r.backport_branches) or 'не заданы'})"
                        for t, r in repos.items()))

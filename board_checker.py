@@ -18,7 +18,8 @@ from tfs import (COMMENT_PREFIX, History, PullRequest, WorkItem, add_workitem_co
                  linked_commits, linked_pull_requests, load_history, load_workitem, mention_html, move_to_board_column,
                  same_person, set_workitem_tag)
 
-CHECK_TAG = "AICheck"  # Тег карточки, при котором выполняются проверки
+# Тег карточки, при котором выполняются проверки ("AICheck"); пустой, None или не задан - проверяются все баги
+CHECK_TAG = None
 # Тег карточки, в которой нет информации о решении бага; по нему правило стиля доски красит карточку в коралловый
 WARNING_TAG = "AIWarning"
 ANALYSIS_COLUMN, READY_FOR_DEV_COLUMN = "Analysis", "ReadyForDev"
@@ -316,13 +317,14 @@ def missing_decision_comment(url: str, person: dict | None, column: str, missing
                              abandoned: list[PullRequest], moved: str = "") -> str:
     """HTML комментария о том, что в карточке нет информации о решении бага, с упоминанием person.
     abandoned - отмененные pull request карточки (у нее нет других), moved - итог возврата карточки из Closed."""
+    check_tag = globals().get("CHECK_TAG")
     return MISSING_DECISION_COMMENT.format(
         person=mention(url, person), column=html.escape(column), explanation=html.escape(missing),
         abandoned=ABANDONED_PR_BLOCK.format(prs=pr_list_html(abandoned)) if abandoned else "",
         moved=f"<br>{html.escape(moved)}" if moved else "",
-        override=CLOSED_OVERRIDE_HINT.format(column=html.escape(CLOSED_COLUMN), tag=html.escape(CHECK_TAG),
+        override=CLOSED_OVERRIDE_HINT.format(column=html.escape(CLOSED_COLUMN), tag=html.escape(check_tag or ""),
                                              warning=html.escape(WARNING_TAG))
-        if column == CLOSED_COLUMN else "")
+        if column == CLOSED_COLUMN and check_tag else "")
 
 
 @dataclass
